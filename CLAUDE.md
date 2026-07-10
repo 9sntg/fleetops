@@ -30,9 +30,10 @@ WSLENV pane forwarding.
 
 ```bash
 ./check.sh              # THE GATE: fmt --check + clippy -D warnings + test (must be green)
-cargo run               # launch the board
-cargo run -- doctor     # read-only drift report (sessions/transcripts/panes/wezterm)
-cargo build --release   # -> target/release/fleet
+fleet                   # launch the board (~/.local/bin/fleet -> target/release/fleet)
+fleet doctor            # read-only drift report (sessions/transcripts/panes/wezterm)
+cargo run               # dev build of the board
+cargo build --release   # refresh the installed binary (the symlink tracks it)
 ```
 
 ## Rules

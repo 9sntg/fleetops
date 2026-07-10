@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- Wave 5 (spec 005): exact pane identity — `WEZTERM_PANE` now crosses into WSL (WSLENV user
+  env var set Windows-side; effective for panes opened after a wezterm restart). Match
+  priority: exact env pane > title > cwd; doctor reports the exact-identity count. Installed
+  `fleet` on PATH (`~/.local/bin/fleet` → release binary, same pattern as `gc`).
 - Waves 2–4 (specs 002–004): rows are now **sessions**, not panes. Discovery from
   `~/.claude/sessions/*.json` with /proc liveness (procStart match) and `CLAUDE_ACCOUNT`
   attribution; transcript-tail telemetry (ctx%, tokens, ai-title, pending AskUserQuestion) with

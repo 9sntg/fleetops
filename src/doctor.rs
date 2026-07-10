@@ -33,6 +33,8 @@ pub struct DoctorFacts {
     pub versions: BTreeSet<String>,
     /// Per live session: (name, transcript found, account attributed, pane matched).
     pub sessions: Vec<(String, bool, bool, bool)>,
+    /// Sessions carrying exact WSLENV pane identity (spec 005).
+    pub exact_panes: usize,
     /// Ok(pane count) or the wezterm failure.
     pub wezterm: Result<usize, String>,
 }
@@ -44,6 +46,7 @@ impl Default for DoctorFacts {
             unknown_statuses: BTreeSet::new(),
             versions: BTreeSet::new(),
             sessions: Vec::new(),
+            exact_panes: 0,
             wezterm: Err("not checked".to_string()),
         }
     }
@@ -85,6 +88,12 @@ pub fn render_report(facts: &DoctorFacts) -> String {
             .join(", ")
     };
     let _ = writeln!(out, "cc versions in live files: {versions}");
+    let _ = writeln!(
+        out,
+        "pane identity: {} of {} sessions exact (WSLENV WEZTERM_PANE)",
+        facts.exact_panes,
+        facts.sessions.len()
+    );
     match &facts.wezterm {
         Ok(count) => {
             let _ = writeln!(out, "wezterm: reachable · {count} panes");
@@ -144,7 +153,15 @@ pub async fn run(runner: &dyn Runner) -> (String, bool) {
                 .as_ref()
                 .and_then(|f| f.ai_title.clone())
                 .unwrap_or_default();
-            let (pane, _) = board::match_pane(&s.file.cwd, &[&ai_title, &s.file.name], &pane_list);
+            if s.wezterm_pane.is_some() {
+                facts.exact_panes += 1;
+            }
+            let (pane, _) = board::match_pane(
+                s.wezterm_pane,
+                &s.file.cwd,
+                &[&ai_title, &s.file.name],
+                &pane_list,
+            );
             facts.sessions.push((
                 s.file.name.clone(),
                 telemetry

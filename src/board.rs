@@ -42,10 +42,23 @@ pub struct SessionRow {
     pub pane_ambiguous: bool,
 }
 
-/// Match a session to a wezterm pane. Title match is PRIMARY (verified live: WSL panes report
-/// the Windows cwd `file:///C:/Users/user/` — OSC7 cwd never crosses from WSL, only titles do);
-/// cwd match is the fallback for the rare pane whose cwd did cross. Returns `(pane, ambiguous)`.
-pub fn match_pane(cwd: &str, names: &[&str], panes: &[PaneRow]) -> (Option<(u64, u64)>, bool) {
+/// Match a session to a wezterm pane. Priority (spec 005):
+/// 1. exact — the session's own `WEZTERM_PANE` (WSLENV-forwarded), if that pane still exists;
+/// 2. title (verified live: WSL panes report the Windows cwd `file:///C:/Users/user/` — OSC7
+///    cwd never crosses from WSL, only titles do);
+/// 3. cwd, for the rare pane whose cwd did cross. Returns `(pane, ambiguous)`.
+pub fn match_pane(
+    env_pane: Option<u64>,
+    cwd: &str,
+    names: &[&str],
+    panes: &[PaneRow],
+) -> (Option<(u64, u64)>, bool) {
+    if let Some(id) = env_pane {
+        if let Some(p) = panes.iter().find(|p| p.pane_id == id) {
+            return (Some((p.tab_id, p.pane_id)), false); // exact identity, never ambiguous
+        }
+        // env pane gone from the list (pane closed / other window) — fall through.
+    }
     let by_title: Vec<&PaneRow> = panes
         .iter()
         .filter(|p| names.iter().any(|n| !n.is_empty() && p.name == *n))
@@ -85,8 +98,12 @@ pub fn assemble(
                 .filter(|t| !t.is_empty())
                 .unwrap_or_else(|| session.file.name.clone());
             // Try both the shown name and the native name — the pane title may carry either.
-            let (pane, pane_ambiguous) =
-                match_pane(&session.file.cwd, &[&name, &session.file.name], panes);
+            let (pane, pane_ambiguous) = match_pane(
+                session.wezterm_pane,
+                &session.file.cwd,
+                &[&name, &session.file.name],
+                panes,
+            );
             SessionRow {
                 session_id: session.file.session_id.clone(),
                 name,
@@ -149,6 +166,7 @@ mod tests {
                 version: None,
             },
             account: Some("golf-acct".to_string()),
+            wezterm_pane: None,
         }
     }
 
@@ -168,26 +186,39 @@ mod tests {
             pane(4, "C:/Users/user", "dupe"),
             pane(5, "C:/Users/user", "dupe"),
         ];
+        // exact env pane beats everything, even a duplicate title situation
+        assert_eq!(
+            match_pane(Some(4), "/z", &["dupe"], &panes),
+            (Some((1, 4)), false)
+        );
+        // env pane no longer in the list → falls through to title
+        assert_eq!(
+            match_pane(Some(99), "/z", &["three"], &panes),
+            (Some((1, 3)), false)
+        );
         // title match is primary — cwd wrong (the WSL reality) but title unique
-        assert_eq!(match_pane("/z", &["three"], &panes), (Some((1, 3)), false));
+        assert_eq!(
+            match_pane(None, "/z", &["three"], &panes),
+            (Some((1, 3)), false)
+        );
         // second name (native) matches when the first (ai-title) doesn't
         assert_eq!(
-            match_pane("/z", &["no", "two"], &panes),
+            match_pane(None, "/z", &["no", "two"], &panes),
             (Some((1, 2)), false)
         );
         // duplicate titles → ambiguous, never guessed
-        assert_eq!(match_pane("/z", &["dupe"], &panes), (None, true));
+        assert_eq!(match_pane(None, "/z", &["dupe"], &panes), (None, true));
         // empty names never match empty-titled panes
-        assert_eq!(match_pane("/z", &[""], &panes), (None, false));
+        assert_eq!(match_pane(None, "/z", &[""], &panes), (None, false));
         // cwd fallback: unique
         assert_eq!(
-            match_pane("/a", &["nomatch"], &panes),
+            match_pane(None, "/a", &["nomatch"], &panes),
             (Some((1, 1)), false)
         );
         // cwd fallback: ambiguous
-        assert_eq!(match_pane("/b", &["nomatch"], &panes), (None, true));
+        assert_eq!(match_pane(None, "/b", &["nomatch"], &panes), (None, true));
         // nothing matches
-        assert_eq!(match_pane("/z", &["x"], &panes), (None, false));
+        assert_eq!(match_pane(None, "/z", &["x"], &panes), (None, false));
     }
 
     #[test]

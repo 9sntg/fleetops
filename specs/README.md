@@ -9,3 +9,4 @@ Waves are defined by the architecture dossier in `plans/001-*`.
 | 2 | [002-wave2-discovery](002-wave2-discovery.md) | ✅ done |
 | 3 | [003-wave3-telemetry](003-wave3-telemetry.md) | ✅ done |
 | 4 | [004-wave4-fold-doctor](004-wave4-fold-doctor.md) | ✅ done |
+| 5 | [005-wave5-wslenv-pane-identity](005-wave5-wslenv-pane-identity.md) | ✅ done (full effect after wezterm restart) |

@@ -95,6 +95,9 @@ pub struct LiveSession {
     pub file: SessionFile,
     /// `CLAUDE_ACCOUNT` from the process environment, if readable.
     pub account: Option<String>,
+    /// `WEZTERM_PANE` from the process environment — exact pane identity (wave 5, needs the
+    /// WSLENV forwarding; absent on sessions started before the wezterm restart).
+    pub wezterm_pane: Option<u64>,
 }
 
 /// Scan tallies for the doctor and footer (files seen vs shown).
@@ -136,13 +139,29 @@ pub fn starttime_from_stat(stat: &str) -> Option<&str> {
     after_comm.split_ascii_whitespace().nth(19)
 }
 
-/// Extract `CLAUDE_ACCOUNT` from NUL-separated `/proc/<pid>/environ` bytes.
-pub fn account_from_environ(environ: &[u8]) -> Option<String> {
-    environ
+/// Facts read from `/proc/<pid>/environ` (NUL-separated bytes) in one pass.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EnvironFacts {
+    /// `CLAUDE_ACCOUNT` — account attribution.
+    pub account: Option<String>,
+    /// `WEZTERM_PANE` — exact pane identity; non-numeric values ignored.
+    pub wezterm_pane: Option<u64>,
+}
+
+/// Extract the fields fleetops needs from environ bytes.
+pub fn parse_environ(environ: &[u8]) -> EnvironFacts {
+    let mut facts = EnvironFacts::default();
+    for entry in environ
         .split(|&b| b == 0)
-        .filter_map(|entry| std::str::from_utf8(entry).ok())
-        .find_map(|entry| entry.strip_prefix("CLAUDE_ACCOUNT="))
-        .map(ToString::to_string)
+        .filter_map(|e| std::str::from_utf8(e).ok())
+    {
+        if let Some(v) = entry.strip_prefix("CLAUDE_ACCOUNT=") {
+            facts.account = Some(v.to_string());
+        } else if let Some(v) = entry.strip_prefix("WEZTERM_PANE=") {
+            facts.wezterm_pane = v.parse().ok();
+        }
+    }
+    facts
 }
 
 /// Scan `sessions_dir`, filter by liveness against `proc_root` (normally `/proc`), attribute
@@ -171,10 +190,15 @@ pub fn scan(sessions_dir: &Path, proc_root: &Path) -> (Vec<LiveSession>, ScanSta
             stats.stale_dead += 1;
             continue;
         }
-        let account = std::fs::read(proc_root.join(file.pid.to_string()).join("environ"))
+        let environ = std::fs::read(proc_root.join(file.pid.to_string()).join("environ"))
             .ok()
-            .and_then(|b| account_from_environ(&b));
-        live.push(LiveSession { file, account });
+            .map(|b| parse_environ(&b))
+            .unwrap_or_default();
+        live.push(LiveSession {
+            file,
+            account: environ.account,
+            wezterm_pane: environ.wezterm_pane,
+        });
     }
     stats.live = live.len();
     (live, stats)
@@ -240,10 +264,18 @@ mod tests {
     }
 
     #[test]
-    fn account_from_environ_finds_claude_account() {
-        let environ = b"PATH=/usr/bin\0CLAUDE_ACCOUNT=golf-acct\0CLAUDE_CONFIG_DIR=/x\0";
-        assert_eq!(account_from_environ(environ), Some("golf-acct".to_string()));
-        assert_eq!(account_from_environ(b"PATH=/usr/bin\0"), None);
+    fn parse_environ_extracts_account_and_pane() {
+        let environ =
+            b"PATH=/usr/bin\0CLAUDE_ACCOUNT=golf-acct\0WEZTERM_PANE=26\0CLAUDE_CONFIG_DIR=/x\0";
+        let facts = parse_environ(environ);
+        assert_eq!(facts.account.as_deref(), Some("golf-acct"));
+        assert_eq!(facts.wezterm_pane, Some(26));
+
+        assert_eq!(parse_environ(b"PATH=/usr/bin\0"), EnvironFacts::default());
+        // non-numeric pane id ignored, account still extracted
+        let weird = parse_environ(b"WEZTERM_PANE=abc\0CLAUDE_ACCOUNT=post\0");
+        assert_eq!(weird.wezterm_pane, None);
+        assert_eq!(weird.account.as_deref(), Some("post"));
     }
 
     /// Build a fake proc root: `<root>/<pid>/stat` (+ optional environ).
