@@ -97,11 +97,61 @@ pub fn activate_tab_args(tab_id: u64) -> Vec<String> {
 
 /// The wezterm binary as reachable from WSL2.
 pub const WEZTERM: &str = "wezterm.exe";
+/// Where the interop binary actually lives on this box — the fallback when fleet is launched
+/// with a minimal PATH (keybinding/launcher shells often lack /mnt/c/...).
+const WEZTERM_ABSOLUTE: &str = "/mnt/c/Program Files/WezTerm/wezterm.exe";
+
+/// Resolve the wezterm program: plain name when PATH can find it (normal shells), the absolute
+/// install path when it can't but the file exists, else the plain name (spawn error stays
+/// visible in the footer). Pure over its inputs for testability.
+fn resolve_wezterm(path_var: Option<&std::ffi::OsStr>, absolute: &std::path::Path) -> String {
+    let on_path =
+        path_var.is_some_and(|p| std::env::split_paths(p).any(|dir| dir.join(WEZTERM).is_file()));
+    if on_path {
+        WEZTERM.to_string()
+    } else if absolute.is_file() {
+        absolute.to_string_lossy().into_owned()
+    } else {
+        WEZTERM.to_string()
+    }
+}
+
+/// The resolved program, computed once per process.
+fn wezterm_program() -> String {
+    static PROGRAM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PROGRAM
+        .get_or_init(|| {
+            let path_var = std::env::var_os("PATH");
+            resolve_wezterm(path_var.as_deref(), std::path::Path::new(WEZTERM_ABSOLUTE))
+        })
+        .clone()
+}
+
+/// Last-good pane list: a wezterm lane error must not blank the board's TAB/PANE columns —
+/// stale matches (with the error in the footer) beat no matches.
+#[derive(Debug, Default)]
+pub struct PaneCache {
+    last: Vec<PaneRow>,
+}
+
+impl PaneCache {
+    /// Fold a lane result: success replaces the cache; failure returns the last good list
+    /// plus the error string for the footer.
+    pub fn fold(&mut self, result: AppResult<Vec<PaneRow>>) -> (Vec<PaneRow>, Option<String>) {
+        match result {
+            Ok(rows) => {
+                self.last.clone_from(&rows);
+                (rows, None)
+            }
+            Err(e) => (self.last.clone(), Some(e.to_string())),
+        }
+    }
+}
 
 /// Build the bounded `cli list` command.
 pub fn list_spec() -> CommandSpec {
     CommandSpec {
-        program: WEZTERM.to_string(),
+        program: wezterm_program(),
         args: list_args(),
         timeout: Duration::from_secs(5),
     }
@@ -110,7 +160,7 @@ pub fn list_spec() -> CommandSpec {
 /// Build the bounded `activate-pane` command.
 pub fn activate_pane_spec(pane_id: u64) -> CommandSpec {
     CommandSpec {
-        program: WEZTERM.to_string(),
+        program: wezterm_program(),
         args: activate_pane_args(pane_id),
         timeout: Duration::from_secs(5),
     }
@@ -119,7 +169,7 @@ pub fn activate_pane_spec(pane_id: u64) -> CommandSpec {
 /// Build the bounded `activate-tab` command.
 pub fn activate_tab_spec(tab_id: u64) -> CommandSpec {
     CommandSpec {
-        program: WEZTERM.to_string(),
+        program: wezterm_program(),
         args: activate_tab_args(tab_id),
         timeout: Duration::from_secs(5),
     }
@@ -297,13 +347,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_wezterm_prefers_path_then_absolute_fallback() {
+        let tmp = std::env::temp_dir().join(format!("fleet-wez-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let exe = tmp.join("wezterm.exe");
+
+        // Not on PATH, fallback file exists → absolute fallback wins.
+        std::fs::write(&exe, b"").unwrap();
+        let path_var = std::ffi::OsString::from("/nonexistent-dir");
+        assert_eq!(
+            resolve_wezterm(Some(&path_var), &exe),
+            exe.to_string_lossy().as_ref()
+        );
+
+        // On PATH → plain program name (PATH resolution at spawn).
+        let path_var = std::ffi::OsString::from(format!("/nonexistent-dir:{}", tmp.display()));
+        assert_eq!(resolve_wezterm(Some(&path_var), &exe), WEZTERM);
+
+        // Neither → plain name (spawn error stays visible in the footer).
+        std::fs::remove_file(&exe).unwrap();
+        let path_var = std::ffi::OsString::from("/nonexistent-dir");
+        assert_eq!(resolve_wezterm(Some(&path_var), &exe), WEZTERM);
+        assert_eq!(resolve_wezterm(None, &exe), WEZTERM);
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn pane_cache_keeps_last_good_list_on_lane_error() {
+        let mut cache = PaneCache::default();
+        let rows = vec![PaneRow {
+            pane_id: 1,
+            tab_id: 1,
+            tab_index: 1,
+            status: PaneStatus::Working,
+            name: "x".to_string(),
+            cwd: "/x".to_string(),
+            is_active: false,
+        }];
+
+        // Success populates the cache and reports no error.
+        let (got, err) = cache.fold(Ok(rows.clone()));
+        assert_eq!(got, rows);
+        assert_eq!(err, None);
+
+        // Failure returns the LAST GOOD list (stale matches beat no matches) + the error.
+        let (got, err) = cache.fold(Err(AppError::Timeout {
+            program: WEZTERM.to_string(),
+            seconds: 5,
+        }));
+        assert_eq!(got, rows, "stale pane list survives a lane error");
+        assert!(err.is_some_and(|e| e.contains("timed out")));
+
+        // Next success replaces it again.
+        let (got, err) = cache.fold(Ok(Vec::new()));
+        assert!(got.is_empty());
+        assert_eq!(err, None);
+    }
+
     #[tokio::test]
     async fn list_panes_runs_the_list_spec() {
         let runner = CannedRunner::new(FIXTURE.to_vec());
         let rows = list_panes(&runner).await.expect("canned list parses");
         assert!(!rows.is_empty());
         let spec = runner.last_spec().expect("spec recorded");
-        assert_eq!(spec.program, WEZTERM);
+        // Program resolves via PATH or the absolute fallback depending on the test env.
+        assert!(spec.program.ends_with(WEZTERM), "got {}", spec.program);
         assert_eq!(spec.args, list_args());
     }
 }

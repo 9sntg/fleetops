@@ -19,7 +19,6 @@ pub mod keys;
 pub mod model;
 pub mod view;
 
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,11 +27,19 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::error::AppResult;
+use crate::panes::PaneCache;
 use crate::runner::{Exec, Runner};
 use crate::telemetry::TailCache;
 use crate::{board, discovery, panes, paths};
 
 use model::{App, Msg, Snapshot};
+
+/// Per-loop sensor caches shared across sweeps (behind one mutex; sweeps are short).
+#[derive(Debug, Default)]
+struct SweepCaches {
+    tails: TailCache,
+    panes: PaneCache,
+}
 
 /// Sensor sweep cadence (spec 001: ~2 s).
 const POLL: Duration = Duration::from_secs(2);
@@ -49,7 +56,7 @@ pub async fn run() -> AppResult<()> {
 
 async fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> AppResult<()> {
     let runner: Arc<dyn Runner> = Arc::new(Exec);
-    let cache = Arc::new(Mutex::new(TailCache::default()));
+    let cache = Arc::new(Mutex::new(SweepCaches::default()));
     let (tx, mut rx) = mpsc::channel::<Msg>(16);
     // Sweeps overlap (5 s wezterm timeout vs 2 s cadence); each carries a monotone seq so the
     // model can drop a late-finishing older sweep instead of stomping fresh data.
@@ -104,7 +111,7 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> AppResult<()> {
 /// Run one full sensor sweep off the UI task; the result arrives as a `Msg` carrying `seq`.
 fn spawn_sweep(
     runner: &Arc<dyn Runner>,
-    cache: &Arc<Mutex<TailCache>>,
+    cache: &Arc<Mutex<SweepCaches>>,
     tx: &mpsc::Sender<Msg>,
     seq: u64,
 ) {
@@ -124,52 +131,39 @@ fn spawn_sweep(
 }
 
 /// One sensor pass: panes (async) + sessions/transcripts (blocking) → assembled snapshot.
-/// A degraded wezterm lane is a `lane_error`, not a failure — session rows still ship.
-async fn sweep(runner: &dyn Runner, cache: &Arc<Mutex<TailCache>>) -> Result<Snapshot, String> {
+/// A degraded wezterm lane is a `lane_error`, not a failure — session rows still ship, and the
+/// LAST GOOD pane list keeps TAB/PANE matches alive (stale beats blank; the footer says so).
+async fn sweep(runner: &dyn Runner, cache: &Arc<Mutex<SweepCaches>>) -> Result<Snapshot, String> {
     let panes_result = panes::list_panes(runner).await;
     let cache = Arc::clone(cache);
-    let (sessions, stats, telemetry) =
-        tokio::task::spawn_blocking(move || scan_fleet(&paths::claude_dir(), &cache))
-            .await
-            .map_err(|e| format!("sweep task: {e}"))?;
-    let (pane_rows, lane_error) = match panes_result {
-        Ok(rows) => (rows, None),
-        Err(e) => (Vec::new(), Some(e.to_string())),
-    };
-    Ok(Snapshot {
-        seq: 0, // stamped by spawn_sweep
-        rows: board::assemble(&sessions, &telemetry, &pane_rows),
-        stats,
-        lane_error,
+    tokio::task::spawn_blocking(move || {
+        let claude_dir = paths::claude_dir();
+        let (sessions, stats) =
+            discovery::scan(&claude_dir.join("sessions"), std::path::Path::new("/proc"));
+        let projects = claude_dir.join("projects");
+        let mut guard = match cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(), // caches are best-effort; still usable
+        };
+        let telemetry: Vec<crate::telemetry::Telemetry> = sessions
+            .iter()
+            .map(|s| guard.tails.read(&projects, &s.file.cwd, &s.file.session_id))
+            .collect();
+        let live_ids: Vec<&str> = sessions
+            .iter()
+            .map(|s| s.file.session_id.as_str())
+            .collect();
+        guard.tails.retain(&live_ids);
+        let (pane_rows, lane_error) = guard.panes.fold(panes_result);
+        Snapshot {
+            seq: 0, // stamped by spawn_sweep
+            rows: board::assemble(&sessions, &telemetry, &pane_rows),
+            stats,
+            lane_error,
+        }
     })
-}
-
-/// Blocking half of the sweep: discovery scan + transcript tails (cached).
-fn scan_fleet(
-    claude_dir: &Path,
-    cache: &Arc<Mutex<TailCache>>,
-) -> (
-    Vec<discovery::LiveSession>,
-    discovery::ScanStats,
-    Vec<crate::telemetry::Telemetry>,
-) {
-    let (sessions, stats) =
-        discovery::scan(&claude_dir.join("sessions"), std::path::Path::new("/proc"));
-    let projects = claude_dir.join("projects");
-    let mut cache = match cache.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(), // cache is best-effort; a poisoned one still works
-    };
-    let telemetry = sessions
-        .iter()
-        .map(|s| cache.read(&projects, &s.file.cwd, &s.file.session_id))
-        .collect();
-    let live_ids: Vec<&str> = sessions
-        .iter()
-        .map(|s| s.file.session_id.as_str())
-        .collect();
-    cache.retain(&live_ids);
-    (sessions, stats, telemetry)
+    .await
+    .map_err(|e| format!("sweep task: {e}"))
 }
 
 /// Fire the jump off the UI task; only failures surface (as a footer `Msg::Error`).
