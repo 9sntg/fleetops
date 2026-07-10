@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+- **Wave 7 (spec 007): DIR up front, with a project badge** — column order is now
+  `STATUS | DIR | SESSION | CTX | TOK | ACCT | AGE | TAB | PANE` (DIR moved next to STATUS,
+  ahead of SESSION). The DIR cell renders `<emoji> <dir_name>`, colored — a pure hash
+  (`dir_badge`, same djb2 + splitmix64 recipe as `account_color`, independent seeds for the
+  emoji pick and the color pick) so a project keeps the same emoji + color across sessions,
+  accounts, and restarts; no config file or per-project mapping.
+
 - **Wave 6 (spec 006): pane highlighting** — sessions needing attention tint their own wezterm
   pane background via OSC 11, written straight to the session's `/dev/pts/N` (no `.wezterm.lua`
   changes): steady amber for NeedsAnswer/Waiting, steady dark red for Stalled. A Working → Idle

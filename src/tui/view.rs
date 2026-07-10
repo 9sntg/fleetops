@@ -6,9 +6,10 @@
 //! Tested:  inline `#[cfg(test)]` TestBackend render assertions
 //!
 //! Key responsibilities:
-//! - Board table: status | tab (tab-bar position) | session | account | ctx% | tokens | age |
-//!   dir (last cwd folder) | pane.
-//! - Stable per-account color (hash into a 6-color palette); status color from one pure map.
+//! - Board table: status | dir (badge: emoji + last cwd folder) | session | ctx% | tokens |
+//!   account | age | tab (tab-bar position) | pane.
+//! - Stable per-account color (hash into a 6-color palette); stable per-dir emoji+color badge
+//!   (two independently-seeded hashes); status color from one pure map.
 //! - Footer: session count, needs-answer count, refresh age, key hints, last error.
 //!
 //! Design constraints:
@@ -81,6 +82,45 @@ fn account_color(account: &str) -> Color {
     PALETTE[usize::try_from(x % 6).unwrap_or(0)]
 }
 
+/// djb2 fold + splitmix64 finalizer — the same recipe as `account_color`, parameterized by a
+/// seed so the emoji pick and the color pick hash independently (spec 007: they must not
+/// correlate).
+fn dir_hash(dir: &str, seed: u64) -> u64 {
+    let mut x: u64 = dir
+        .bytes()
+        .map(u64::from)
+        .fold(seed, |h, b| h.wrapping_mul(33) ^ b);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    x
+}
+
+/// Stable dir badge: same dir name -> same emoji + color always (pure hash, like
+/// `account_color`). Emoji and color are hashed with independent seeds so they don't
+/// correlate (12 emoji x 6 colors = 72 effective combos). Seeds 9/5 are tuned so the six real
+/// project dirs on this box (fleetops, tokenomics, brain, projectx, oh, lightrag) land on six
+/// distinct (emoji, color) pairs — re-tune if a new project dir collides (same pattern as the
+/// account seed-18 note on `account_color`).
+fn dir_badge(dir: &str) -> (char, Color) {
+    const EMOJI: [char; 12] = [
+        '🦀', '🧠', '🚀', '📦', '🌊', '🔥', '🐙', '🎯', '🌿', '💎', '⚡', '🍋',
+    ];
+    const PALETTE: [Color; 6] = [
+        Color::Cyan,
+        Color::LightMagenta,
+        Color::LightBlue,
+        Color::LightGreen,
+        Color::LightYellow,
+        Color::LightRed,
+    ];
+    const EMOJI_SEED: u64 = 9;
+    const COLOR_SEED: u64 = 5;
+    let emoji = EMOJI[usize::try_from(dir_hash(dir, EMOJI_SEED) % 12).unwrap_or(0)];
+    let color = PALETTE[usize::try_from(dir_hash(dir, COLOR_SEED) % 6).unwrap_or(0)];
+    (emoji, color)
+}
+
 /// TAB cell: the 1-based tab-bar position (what the tab bar shows), `≈?`/`—` when unmatched.
 fn tab_cell(row: &SessionRow) -> String {
     match (&row.pane, row.pane_ambiguous) {
@@ -134,7 +174,7 @@ fn age_style(secs: u64) -> Style {
 
 fn render_table(f: &mut Frame<'_>, area: Rect, app: &App) {
     let header = Row::new([
-        "STATUS", "TAB", "SESSION", "ACCT", "CTX", "TOK", "AGE", "DIR", "PANE",
+        "STATUS", "DIR", "SESSION", "CTX", "TOK", "ACCT", "AGE", "TAB", "PANE",
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
     let selected = app.selected_index();
@@ -146,6 +186,8 @@ fn render_table(f: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             Style::default().fg(account_color(&account))
         };
+        let dir = dir_name(&r.cwd);
+        let (dir_emoji, dir_color) = dir_badge(dir);
         let (ctx_cell, tok) = r.context_tokens.map_or_else(
             || (Cell::from("—"), "—".to_string()),
             |t| {
@@ -162,13 +204,13 @@ fn render_table(f: &mut Frame<'_>, area: Rect, app: &App) {
         );
         let row = Row::new([
             Cell::from(label).style(style),
-            Cell::from(tab_cell(r)),
+            Cell::from(format!("{dir_emoji} {dir}")).style(Style::default().fg(dir_color)),
             Cell::from(r.name.clone()),
-            Cell::from(account).style(account_style),
             ctx_cell,
             Cell::from(tok),
+            Cell::from(account).style(account_style),
             age_cell,
-            Cell::from(dir_name(&r.cwd).to_string()),
+            Cell::from(tab_cell(r)),
             Cell::from(pane_cell(r)),
         ]);
         if selected == Some(i) {
@@ -181,13 +223,13 @@ fn render_table(f: &mut Frame<'_>, area: Rect, app: &App) {
         rows,
         [
             Constraint::Length(10),
-            Constraint::Length(3),
+            Constraint::Max(18),
             Constraint::Min(24),
-            Constraint::Length(8), // longest real account name ("echo-acct"/"projectz")
             Constraint::Length(10),
             Constraint::Length(5),
+            Constraint::Length(8), // longest real account name ("echo-acct"/"projectz")
             Constraint::Length(4),
-            Constraint::Max(16),
+            Constraint::Length(3),
             Constraint::Length(5),
         ],
     )
@@ -393,5 +435,69 @@ mod tests {
         let app = App::default();
         let screen = rendered(&app);
         assert!(screen.contains("fleet — 0 sessions"));
+    }
+
+    #[test]
+    fn header_order_status_dir_session_left_to_right() {
+        let app = App::default();
+        let screen = rendered(&app);
+        let header_line = screen
+            .lines()
+            .find(|l| l.contains("STATUS"))
+            .expect("header line with STATUS");
+        let status_pos = header_line.find("STATUS").expect("STATUS in header");
+        let dir_pos = header_line.find("DIR").expect("DIR in header");
+        let session_pos = header_line.find("SESSION").expect("SESSION in header");
+        assert!(status_pos < dir_pos, "spec 007: STATUS must precede DIR");
+        assert!(dir_pos < session_pos, "spec 007: DIR must precede SESSION");
+    }
+
+    #[test]
+    fn dir_badge_is_stable() {
+        assert_eq!(
+            dir_badge("fleetops"),
+            dir_badge("fleetops"),
+            "same dir name -> same badge every call"
+        );
+    }
+
+    #[test]
+    fn dir_badge_distinct_for_known_dirs() {
+        // The six real project dirs on this box — spec 007: all distinct (emoji, color) pairs.
+        let dirs = ["fleetops", "tokenomics", "brain", "projectx", "oh", "lightrag"];
+        let distinct: std::collections::HashSet<_> = dirs
+            .iter()
+            .map(|d| {
+                let (emoji, color) = dir_badge(d);
+                (emoji, format!("{color:?}"))
+            })
+            .collect();
+        assert_eq!(
+            distinct.len(),
+            6,
+            "all six real dirs distinct: {distinct:?}"
+        );
+    }
+
+    #[test]
+    fn dir_cell_renders_badge_emoji_and_name() {
+        let mut app = App::default();
+        app.update(Msg::Snapshot(Box::new(Snapshot {
+            rows: vec![row("a", Status::Working, "x", None)],
+            ..Snapshot::default()
+        })));
+        let screen = rendered(&app);
+        let (emoji, _) = dir_badge("fleetops");
+        // Width-2 emoji leave a blank placeholder cell in TestBackend's buffer, so assert
+        // ordering (emoji before name on the row) rather than exact adjacency.
+        let row_line = screen
+            .lines()
+            .find(|l| l.contains("fleetops"))
+            .expect("row line with the dir name");
+        let emoji_pos = row_line
+            .find(emoji)
+            .expect("badge emoji rendered in the DIR cell");
+        let name_pos = row_line.find("fleetops").expect("dir name rendered");
+        assert!(emoji_pos < name_pos, "badge emoji precedes the dir name");
     }
 }
