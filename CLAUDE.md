@@ -1,0 +1,58 @@
+# Fleetops
+
+Fleetops is a single-binary Rust TUI that monitors **all running Claude Code sessions** on this
+machine — the fleet. Per session it shows a **semantic name** (what the session is working on),
+**status** (working / done / needs input / question), **tokens spent**, **context % remaining**
+(same numbers as the status bar), and the wezterm pane it lives in (jump-to-pane). Sessions run
+across one wezterm window with many tabs/panes; fleetops renders the overview on the TUI monitor.
+Built for WSL2. Sibling of `/tui/tokenomics` (accounts/limits) — fleetops is per-**session**,
+tokenomics is per-**account**.
+
+## Status
+
+**Pre-architecture.** Stack decree: Rust + ratatui, same shape as tokenomics. The architecture
+dossier lives in `plans/001-*` (oh-architecture output); specs and code follow it. Verified data
+sources so far: `docs/RESEARCH.md`.
+
+## Tech Stack (decreed, details pending dossier)
+
+| Layer | Technology |
+|-------|-----------|
+| Language | Rust (2021, strict — `forbid(unsafe_code)`, clippy pedantic `-D warnings`) |
+| TUI | ratatui + crossterm |
+| Async | tokio (never block the UI task; results arrive as messages over channels) |
+
+## Commands
+
+```bash
+./check.sh   # THE GATE: fmt --check + clippy -D warnings + test (must be green)
+```
+
+## Rules
+
+**Read before writing any code.** All coding rules live in `rules/`. Start at `rules/_index.md`;
+route via `rules/crossroads.md`. Every `.rs` file carries a `//!` module header per
+`rules/file-headers.md`. Rust specifics: `rules/rust/{strict-lints,ratatui-architecture,
+subprocess-safety,async-tokio,error-handling,anti-patterns}.md`.
+
+## Specs
+
+**Development is spec-driven TDD.** One spec per wave in `specs/` (index: `specs/README.md`).
+Cycle per wave: **spec → 🔴 red → 🟢 green → ♻ refactor-for-specs → ♻ refactor-for-rules**. Mark
+ambiguities `[NEEDS CLARIFICATION]`; never guess.
+
+## Versioning
+
+- Maintain `CHANGELOG.md` `[Unreleased]` — entry for every user-facing change, same commit.
+- Never bump the version or cut a release — only the user does.
+
+## Git
+
+- **Default branch: `dev`.** Never push directly to `main`.
+
+## Boundaries
+
+- **Always**: run `./check.sh` green before calling a wave done. Follow `rules/`.
+- **Ask first**: new external dependency; anything that writes into a Claude config/session dir.
+- **Never**: `unsafe`. `unwrap`/`expect`/`panic!` in runtime paths. Log or print tokens/secrets
+  from session transcripts. Mutate another session's files — fleetops is **read-only** over the fleet.
