@@ -13,7 +13,7 @@
 //!
 //! Design constraints:
 //! - Async work never runs on the UI task — sweeps and jumps are spawned; the loop only `select!`s.
-//! - Read-only over the fleet; the only mutating verb is `activate-pane` (focus).
+//! - Read-only over the fleet; the only mutating verbs are `activate-tab`/`-pane` (focus).
 
 pub mod keys;
 pub mod model;
@@ -50,7 +50,10 @@ const TICK: Duration = Duration::from_secs(1);
 pub async fn run() -> AppResult<()> {
     let mut terminal = ratatui::try_init()?;
     let result = event_loop(&mut terminal).await;
-    let _ = ratatui::try_restore();
+    if let Err(e) = ratatui::try_restore() {
+        // A swallowed restore failure leaves a garbled raw-mode terminal with zero explanation.
+        eprintln!("fleet: terminal restore failed: {e} — run `reset`");
+    }
     result
 }
 
@@ -61,14 +64,12 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> AppResult<()> {
     // Sweeps overlap (5 s wezterm timeout vs 2 s cadence); each carries a monotone seq so the
     // model can drop a late-finishing older sweep instead of stomping fresh data.
     let mut sweep_seq: u64 = 0;
-    sweep_seq += 1;
-    spawn_sweep(&runner, &cache, &tx, sweep_seq);
 
     let mut app = App::default();
     let mut events = EventStream::new();
+    // The interval's built-in immediate first tick IS the t=0 sweep.
     let mut poll = tokio::time::interval(POLL);
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    poll.tick().await; // consume the immediate first tick; spawn_sweep above covers t=0
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -83,7 +84,9 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> AppResult<()> {
                     }
                 }
                 Some(Ok(_)) => {} // resize etc. — next draw picks it up
-                Some(Err(_)) | None => break,
+                // A dying event stream (tty EIO) must not look like a clean `q` — exit nonzero.
+                Some(Err(e)) => return Err(e.into()),
+                None => break,
             },
             Some(msg) = rx.recv() => app.update(msg),
             _ = poll.tick() => {
@@ -95,8 +98,12 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> AppResult<()> {
 
         if app.refresh_requested {
             app.refresh_requested = false;
-            sweep_seq += 1;
-            spawn_sweep(&runner, &cache, &tx, sweep_seq);
+            // Coalesce: held-down 'r' (autorepeat ~30 Hz) must not stack a subprocess fan-out
+            // per keypress — one manual sweep in flight at a time.
+            if app.sweeps_settled(sweep_seq) {
+                sweep_seq += 1;
+                spawn_sweep(&runner, &cache, &tx, sweep_seq);
+            }
         }
         if let Some(target) = app.pending_jump.take() {
             spawn_jump(&runner, &tx, target);
@@ -155,6 +162,7 @@ async fn sweep(runner: &dyn Runner, cache: &Arc<Mutex<SweepCaches>>) -> Result<S
             .collect();
         guard.tails.retain(&live_ids);
         let (pane_rows, lane_error) = guard.panes.fold(panes_result);
+        drop(guard); // release the caches before the (allocating) assemble
         Snapshot {
             seq: 0, // stamped by spawn_sweep
             rows: board::assemble(&sessions, &telemetry, &pane_rows),

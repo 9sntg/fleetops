@@ -85,6 +85,13 @@ pub struct App {
 }
 
 impl App {
+    /// True when every spawned sweep (up to `latest_seq`) has landed. The loop coalesces manual
+    /// refreshes on this — key autorepeat must not stack a sweep (and its subprocess fan-out)
+    /// per keypress. An errored sweep never lands; the next 2 s poll unblocks that case.
+    pub const fn sweeps_settled(&self, latest_seq: u64) -> bool {
+        self.applied_seq >= latest_seq
+    }
+
     /// Index of the selected row, if it still exists.
     pub fn selected_index(&self) -> Option<usize> {
         let id = self.selected.as_deref()?;
@@ -325,6 +332,18 @@ mod tests {
         })));
         assert_eq!(app.rows.len(), 1, "fresh rows kept");
         assert_eq!(app.error, None, "stale lane error never shown");
+    }
+
+    #[test]
+    fn sweeps_settled_tracks_the_applied_seq() {
+        let mut app = App::default();
+        assert!(app.sweeps_settled(0), "nothing spawned = settled");
+        assert!(!app.sweeps_settled(1), "sweep 1 in flight");
+        app.update(Msg::Snapshot(Box::new(Snapshot {
+            seq: 1,
+            ..Snapshot::default()
+        })));
+        assert!(app.sweeps_settled(1));
     }
 
     #[test]

@@ -13,6 +13,7 @@ path = "src/main.rs"
 [lints.rust]
 unsafe_code = "forbid"
 missing_debug_implementations = "warn"
+missing_docs = "warn"
 rust_2018_idioms = { level = "warn", priority = -1 }
 # unreachable_pub intentionally omitted: bin crate (no lib consumers) — it would demand
 # pub(crate) on every item, pure noise. Visibility discipline is covered by review.
@@ -20,6 +21,8 @@ rust_2018_idioms = { level = "warn", priority = -1 }
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
 # Curated allows — each justified:
 module_name_repetitions = "allow"   # panes::PaneRow reads fine
 missing_errors_doc = "allow"        # error enums are self-describing in this crate
@@ -35,7 +38,7 @@ lto = "thin"
 # justified by a landed feature. All wave-1 (spec 001).
 [dependencies]
 async-trait = "0.1"                                             # W1: object-safe async Runner seam
-crossterm = { version = "0.29", features = ["event-stream"] }   # W1: terminal backend + async key events
+crossterm = { version = "0.28", features = ["event-stream"] }   # W1: async key events; pinned to ratatui 0.29's crossterm so ONE copy links (cargo tree -d clean)
 futures = "0.3"                                                 # W1: EventStream::next in the TUI loop
 ratatui = "0.29"                                                # W1: the board
 serde = { version = "1", features = ["derive"] }                # W1: wezterm cli list JSON

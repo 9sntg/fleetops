@@ -39,7 +39,7 @@ pub enum Status {
 }
 
 /// The fold. First match wins (spec 004 table).
-pub fn status(
+pub const fn status(
     native: &NativeStatus,
     pending_question: bool,
     secs_since_append: Option<u64>,
@@ -60,7 +60,7 @@ pub fn status(
 }
 
 /// Sort bucket: lower = higher on the board.
-pub fn sort_key(status: Status) -> u8 {
+pub const fn sort_key(status: Status) -> u8 {
     match status {
         Status::NeedsAnswer => 0,
         Status::Waiting => 1,

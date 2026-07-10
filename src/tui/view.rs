@@ -183,7 +183,7 @@ fn render_table(f: &mut Frame<'_>, area: Rect, app: &App) {
             Constraint::Length(10),
             Constraint::Length(3),
             Constraint::Min(24),
-            Constraint::Length(6),
+            Constraint::Length(8), // longest real account name ("echo-acct"/"projectz")
             Constraint::Length(10),
             Constraint::Length(5),
             Constraint::Length(4),
@@ -211,16 +211,21 @@ fn render_footer(f: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         ""
     };
+    // Format drift makes sessions vanish silently — the footer must count the casualties.
+    let parse_warn = if app.stats.parse_failed > 0 {
+        format!("⚠ {} unparseable session files · ", app.stats.parse_failed)
+    } else {
+        String::new()
+    };
     let stats = format!(
-        "{dir_warn}{} live · {} need answer · {} stale files · refreshed {}s ago",
+        "{dir_warn}{parse_warn}{} live · {} need answer · {} stale files · refreshed {}s ago",
         app.stats.live, needs, app.stats.stale_dead, app.refresh_age_secs
     );
     // Spec 004: stats PLUS the error — an error must not hide the freshness/counts.
-    let text = if let Some(e) = &app.error {
-        format!("{stats} · ! {e}")
-    } else {
-        format!("{stats} · j/k move · Enter jump · r refresh · q quit")
-    };
+    let text = app.error.as_ref().map_or_else(
+        || format!("{stats} · j/k move · Enter jump · r refresh · q quit"),
+        |e| format!("{stats} · ! {e}"),
+    );
     let style = if app.error.is_some() {
         Style::default().fg(Color::Red)
     } else {
@@ -344,6 +349,28 @@ mod tests {
             !screen.contains("Enter jump"),
             "hints yield the space to the error"
         );
+    }
+
+    #[test]
+    fn footer_counts_parse_failures_and_acct_fits_the_longest_account() {
+        let mut app = App::default();
+        let mut r = row("a", Status::Working, "x", None);
+        r.account = Some("echo-acct".to_string());
+        app.update(Msg::Snapshot(Box::new(Snapshot {
+            rows: vec![r],
+            stats: ScanStats {
+                parse_failed: 3,
+                live: 1,
+                ..ScanStats::default()
+            },
+            ..Snapshot::default()
+        })));
+        let screen = rendered(&app);
+        assert!(
+            screen.contains("⚠ 3 unparseable session files"),
+            "format drift must not read as a smaller fleet"
+        );
+        assert!(screen.contains("echo-acct"), "8-char account not truncated");
     }
 
     #[test]

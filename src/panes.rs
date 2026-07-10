@@ -6,7 +6,7 @@
 //! Tested:  inline `#[cfg(test)]` against tests/fixtures/wezterm-list.json (captured live 2026-07-10)
 //!
 //! Key responsibilities:
-//! - Discover ALL live wezterm instances (tasklist PIDs × gui-sock-<pid> files) — a `cli`
+//! - Discover ALL live wezterm instances (tasklist PIDs × `gui-sock-<pid>` files) — a `cli`
 //!   call answers only from the instance owning the invoking pane's interop, so fleet running
 //!   on the TUI monitor sees zero Claude panes unless each instance is targeted explicitly
 //!   via a WSLENV-forwarded `WEZTERM_UNIX_SOCKET` (verified live 2026-07-10; flag `/w`).
@@ -75,9 +75,10 @@ struct RawPane {
     is_active: bool,
 }
 
-/// argv for `wezterm.exe cli list --format json`.
+/// argv for `wezterm.exe cli list --format json`. `--no-auto-start` on every cli call: a
+/// socketless environment must yield a visible lane error, never silently spawn a mux server.
 pub fn list_args() -> Vec<String> {
-    ["cli", "list", "--format", "json"]
+    ["cli", "--no-auto-start", "list", "--format", "json"]
         .iter()
         .map(ToString::to_string)
         .collect()
@@ -87,6 +88,7 @@ pub fn list_args() -> Vec<String> {
 pub fn activate_pane_args(pane_id: u64) -> Vec<String> {
     vec![
         "cli".to_string(),
+        "--no-auto-start".to_string(),
         "activate-pane".to_string(),
         "--pane-id".to_string(),
         pane_id.to_string(),
@@ -98,6 +100,7 @@ pub fn activate_pane_args(pane_id: u64) -> Vec<String> {
 pub fn activate_tab_args(tab_id: u64) -> Vec<String> {
     vec![
         "cli".to_string(),
+        "--no-auto-start".to_string(),
         "activate-tab".to_string(),
         "--tab-id".to_string(),
         tab_id.to_string(),
@@ -188,41 +191,62 @@ fn socket_env(socket_win: &str) -> Vec<(String, String)> {
 pub async fn discover_sockets(runner: &dyn Runner) -> AppResult<Vec<String>> {
     let bytes = runner.run(&tasklist_spec()).await?;
     let pids = parse_tasklist_pids(&bytes);
-    Ok(pids
-        .into_iter()
-        .filter(|pid| {
-            std::path::Path::new(SOCK_DIR_WSL)
-                .join(format!("gui-sock-{pid}"))
-                .is_file()
-        })
-        .map(|pid| format!("{SOCK_DIR_WIN}\\gui-sock-{pid}"))
-        .collect())
+    // /mnt/c (drvfs) stats can block for seconds — never on an async runtime worker.
+    tokio::task::spawn_blocking(move || {
+        pids.into_iter()
+            .filter(|pid| {
+                std::path::Path::new(SOCK_DIR_WSL)
+                    .join(format!("gui-sock-{pid}"))
+                    .is_file()
+            })
+            .map(|pid| format!("{SOCK_DIR_WIN}\\gui-sock-{pid}"))
+            .collect()
+    })
+    .await
+    .map_err(|e| AppError::Subprocess {
+        program: "tasklist.exe".to_string(),
+        message: format!("socket filter task: {e}"),
+    })
 }
 
-/// Query every live instance and merge their Claude panes. Degrades per instance: one failing
-/// instance is skipped; only total failure (or discovery failure) is an error.
-pub async fn list_all_panes(runner: &dyn Runner) -> AppResult<Vec<PaneRow>> {
+/// Query every live instance and merge their Claude panes. Degrades per instance: a failing
+/// instance's error rides along as the lane note (the footer must say the pane lane is
+/// degraded — silence here blanks that instance's TAB/PANE with no explanation); only total
+/// failure (or discovery failure) is an error.
+pub async fn list_all_panes(runner: &dyn Runner) -> AppResult<(Vec<PaneRow>, Option<String>)> {
     let sockets = discover_sockets(runner).await?;
     if sockets.is_empty() {
         // No instance discovered (tasklist empty?) — fall back to the invoker's own instance.
-        return list_panes(runner, "").await;
+        return Ok((list_panes(runner, "").await?, None));
     }
     let queries = sockets.iter().map(|s| list_panes(runner, s));
-    let results = futures::future::join_all(queries).await;
+    merge_instance_results(futures::future::join_all(queries).await)
+}
+
+/// Merge per-instance results: rows from every healthy instance + the first failure (if any).
+fn merge_instance_results(
+    results: Vec<AppResult<Vec<PaneRow>>>,
+) -> AppResult<(Vec<PaneRow>, Option<String>)> {
     let mut merged = Vec::new();
-    let mut last_err = None;
+    let mut any_ok = false;
+    let mut first_err = None;
     for result in results {
         match result {
-            Ok(mut rows) => merged.append(&mut rows),
-            Err(e) => last_err = Some(e),
+            Ok(mut rows) => {
+                any_ok = true;
+                merged.append(&mut rows);
+            }
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
         }
     }
-    if merged.is_empty() {
-        if let Some(e) = last_err {
-            return Err(e);
-        }
+    match (any_ok, first_err) {
+        (false, Some(e)) => Err(e), // no instance answered — the lane is down
+        (_, e) => Ok((merged, e.map(|e| e.to_string()))),
     }
-    Ok(merged)
 }
 
 /// Last-good pane list: a wezterm lane error must not blank the board's TAB/PANE columns —
@@ -233,24 +257,35 @@ pub struct PaneCache {
 }
 
 impl PaneCache {
-    /// Fold a lane result: success replaces the cache; failure returns the last good list
-    /// plus the error string for the footer.
-    pub fn fold(&mut self, result: AppResult<Vec<PaneRow>>) -> (Vec<PaneRow>, Option<String>) {
+    /// Fold a lane result: a CLEAN success replaces the cache; a partial success (an instance
+    /// failed) must not — its rows would silently evict the failing instance's last-good panes.
+    /// Failures return the last good list; every degradation carries its footer string.
+    pub fn fold(
+        &mut self,
+        result: AppResult<(Vec<PaneRow>, Option<String>)>,
+    ) -> (Vec<PaneRow>, Option<String>) {
         match result {
-            Ok(rows) => {
+            Ok((rows, None)) => {
                 self.last.clone_from(&rows);
                 (rows, None)
+            }
+            Ok((rows, Some(e))) => {
+                if self.last.is_empty() {
+                    (rows, Some(e)) // cold cache: partial beats blank (uncached — retry heals)
+                } else {
+                    (self.last.clone(), Some(e))
+                }
             }
             Err(e) => (self.last.clone(), Some(e.to_string())),
         }
     }
 }
 
-/// Build the bounded `cli list` command against one instance ("" = invoker's own).
-pub fn list_spec(socket_win: &str) -> CommandSpec {
+/// Build a bounded wezterm command against one instance ("" = invoker's own).
+fn wezterm_spec(socket_win: &str, args: Vec<String>) -> CommandSpec {
     CommandSpec {
         program: wezterm_program(),
-        args: list_args(),
+        args,
         env: if socket_win.is_empty() {
             Vec::new()
         } else {
@@ -258,34 +293,21 @@ pub fn list_spec(socket_win: &str) -> CommandSpec {
         },
         timeout: Duration::from_secs(5),
     }
+}
+
+/// Build the bounded `cli list` command against one instance ("" = invoker's own).
+pub fn list_spec(socket_win: &str) -> CommandSpec {
+    wezterm_spec(socket_win, list_args())
 }
 
 /// Build the bounded `activate-pane` command against the pane's instance.
 pub fn activate_pane_spec(socket_win: &str, pane_id: u64) -> CommandSpec {
-    CommandSpec {
-        program: wezterm_program(),
-        args: activate_pane_args(pane_id),
-        env: if socket_win.is_empty() {
-            Vec::new()
-        } else {
-            socket_env(socket_win)
-        },
-        timeout: Duration::from_secs(5),
-    }
+    wezterm_spec(socket_win, activate_pane_args(pane_id))
 }
 
 /// Build the bounded `activate-tab` command against the pane's instance.
 pub fn activate_tab_spec(socket_win: &str, tab_id: u64) -> CommandSpec {
-    CommandSpec {
-        program: wezterm_program(),
-        args: activate_tab_args(tab_id),
-        env: if socket_win.is_empty() {
-            Vec::new()
-        } else {
-            socket_env(socket_win)
-        },
-        timeout: Duration::from_secs(5),
-    }
+    wezterm_spec(socket_win, activate_tab_args(tab_id))
 }
 
 /// Run `cli list` against one instance and return its Claude pane rows, sorted by `pane_id`.
@@ -450,15 +472,94 @@ mod tests {
 
     #[test]
     fn argv_builders() {
-        assert_eq!(list_args(), ["cli", "list", "--format", "json"]);
+        // --no-auto-start everywhere: a socketless call must fail visibly, never spawn a
+        // headless mux server as a side effect of a 2 s sweep.
+        assert_eq!(
+            list_args(),
+            ["cli", "--no-auto-start", "list", "--format", "json"]
+        );
         assert_eq!(
             activate_pane_args(42),
-            ["cli", "activate-pane", "--pane-id", "42"]
+            ["cli", "--no-auto-start", "activate-pane", "--pane-id", "42"]
         );
         assert_eq!(
             activate_tab_args(7),
-            ["cli", "activate-tab", "--tab-id", "7"]
+            ["cli", "--no-auto-start", "activate-tab", "--tab-id", "7"]
         );
+    }
+
+    #[test]
+    fn merge_surfaces_partial_instance_failure_and_keeps_total_failure_an_error() {
+        let row = |id: u64| PaneRow {
+            socket: "C:\\sock-a".to_string(),
+            pane_id: id,
+            tab_id: 1,
+            tab_index: 1,
+            status: PaneStatus::Working,
+            name: "x".to_string(),
+            cwd: "/x".to_string(),
+            is_active: false,
+        };
+        let timeout = || {
+            Err(AppError::Timeout {
+                program: WEZTERM.to_string(),
+                seconds: 5,
+            })
+        };
+        // Partial: healthy rows AND the failing instance's error — the footer must not stay silent.
+        let (rows, err) =
+            merge_instance_results(vec![Ok(vec![row(1)]), timeout()]).expect("partial is Ok");
+        assert_eq!(rows.len(), 1);
+        assert!(err.is_some_and(|e| e.contains("timed out")));
+        // Clean: no error.
+        let (rows, err) =
+            merge_instance_results(vec![Ok(vec![row(1)]), Ok(vec![row(2)])]).expect("clean merge");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(err, None);
+        // Total failure: an error, not an empty success.
+        assert!(merge_instance_results(vec![timeout(), timeout()]).is_err());
+    }
+
+    #[test]
+    fn pane_cache_never_overwrites_last_good_with_a_partial_list() {
+        let full = vec![
+            PaneRow {
+                socket: "C:\\sock-a".to_string(),
+                pane_id: 1,
+                tab_id: 1,
+                tab_index: 1,
+                status: PaneStatus::Working,
+                name: "a".to_string(),
+                cwd: "/a".to_string(),
+                is_active: false,
+            },
+            PaneRow {
+                socket: "C:\\sock-b".to_string(),
+                pane_id: 1,
+                tab_id: 1,
+                tab_index: 1,
+                status: PaneStatus::Idle,
+                name: "b".to_string(),
+                cwd: "/b".to_string(),
+                is_active: false,
+            },
+        ];
+        let mut cache = PaneCache::default();
+        let (got, err) = cache.fold(Ok((full.clone(), None)));
+        assert_eq!(got.len(), 2);
+        assert_eq!(err, None);
+
+        // Instance B degraded: last-good (both instances) survives, error surfaces.
+        let partial = vec![full[0].clone()];
+        let (got, err) = cache.fold(Ok((partial, Some("sock-b: timed out".to_string()))));
+        assert_eq!(got, full, "stale full list beats fresh partial list");
+        assert!(err.is_some_and(|e| e.contains("timed out")));
+
+        // Cold cache + partial: the partial rows are still better than nothing.
+        let mut cold = PaneCache::default();
+        let (got, err) = cold.fold(Ok((vec![full[0].clone()], Some("e".to_string()))));
+        assert_eq!(got.len(), 1);
+        assert!(err.is_some());
     }
 
     #[test]
@@ -503,7 +604,7 @@ mod tests {
         }];
 
         // Success populates the cache and reports no error.
-        let (got, err) = cache.fold(Ok(rows.clone()));
+        let (got, err) = cache.fold(Ok((rows.clone(), None)));
         assert_eq!(got, rows);
         assert_eq!(err, None);
 
@@ -515,8 +616,8 @@ mod tests {
         assert_eq!(got, rows, "stale pane list survives a lane error");
         assert!(err.is_some_and(|e| e.contains("timed out")));
 
-        // Next success replaces it again.
-        let (got, err) = cache.fold(Ok(Vec::new()));
+        // Next clean success replaces it again.
+        let (got, err) = cache.fold(Ok((Vec::new(), None)));
         assert!(got.is_empty());
         assert_eq!(err, None);
     }
@@ -566,7 +667,10 @@ garbage line\r\n";
     #[test]
     fn jump_specs_carry_the_socket_env() {
         let tab = activate_tab_spec("C:\\sock-a", 7);
-        assert_eq!(tab.args, ["cli", "activate-tab", "--tab-id", "7"]);
+        assert_eq!(
+            tab.args,
+            ["cli", "--no-auto-start", "activate-tab", "--tab-id", "7"]
+        );
         assert_eq!(tab.env[0].1, "C:\\sock-a");
         let pane = activate_pane_spec("", 9);
         assert!(pane.env.is_empty(), "own instance needs no socket env");

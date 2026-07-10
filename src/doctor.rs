@@ -15,7 +15,6 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 
 use crate::discovery::{self, NativeStatus, ScanStats};
 use crate::runner::Runner;
@@ -39,6 +38,8 @@ pub struct DoctorFacts {
     pub instances: usize,
     /// Ok(pane count) or the wezterm failure.
     pub wezterm: Result<usize, String>,
+    /// One instance answered, another failed — the pane list is partial.
+    pub instance_error: Option<String>,
 }
 
 impl Default for DoctorFacts {
@@ -51,6 +52,7 @@ impl Default for DoctorFacts {
             exact_panes: 0,
             instances: 0,
             wezterm: Err("not checked".to_string()),
+            instance_error: None,
         }
     }
 }
@@ -112,6 +114,12 @@ pub fn render_report(facts: &DoctorFacts) -> String {
             );
         }
     }
+    if let Some(e) = &facts.instance_error {
+        let _ = writeln!(
+            out,
+            "  ⚠ instance degraded: {e} — pane list is PARTIAL, counts above undercount"
+        );
+    }
     let _ = writeln!(out, "\nlive sessions ({}):", facts.sessions.len());
     for (name, transcript, account, pane) in &facts.sessions {
         let mark = |b: bool| if b { "✓" } else { "✗" };
@@ -131,22 +139,20 @@ pub fn render_report(facts: &DoctorFacts) -> String {
 pub async fn run(runner: &dyn Runner) -> (String, bool) {
     let claude_dir = paths::claude_dir();
     let instances = panes::discover_sockets(runner).await.map_or(0, |s| s.len());
-    let (wezterm, pane_list) = match panes::list_all_panes(runner).await {
-        Ok(rows) => (Ok(rows.len()), rows),
-        Err(e) => (Err(e.to_string()), Vec::new()),
+    let (wezterm, pane_list, instance_error) = match panes::list_all_panes(runner).await {
+        Ok((rows, partial)) => (Ok(rows.len()), rows, partial),
+        Err(e) => (Err(e.to_string()), Vec::new(), None),
     };
 
     let facts = tokio::task::spawn_blocking(move || {
         let (sessions, scan) = discovery::scan(&claude_dir.join("sessions"), Path::new("/proc"));
-        let cache = Arc::new(Mutex::new(TailCache::default()));
-        let mut guard = cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cache = TailCache::default();
         let projects = claude_dir.join("projects");
         let mut facts = DoctorFacts {
             scan,
             instances,
             wezterm,
+            instance_error,
             ..DoctorFacts::default()
         };
         for s in &sessions {
@@ -156,7 +162,7 @@ pub async fn run(runner: &dyn Runner) -> (String, bool) {
             if let Some(v) = &s.file.version {
                 facts.versions.insert(v.clone());
             }
-            let telemetry = guard.read(&projects, &s.file.cwd, &s.file.session_id);
+            let telemetry = cache.read(&projects, &s.file.cwd, &s.file.session_id);
             let ai_title = telemetry
                 .facts
                 .as_ref()
@@ -171,21 +177,21 @@ pub async fn run(runner: &dyn Runner) -> (String, bool) {
                 &[&ai_title, &s.file.name],
                 &pane_list,
             );
+            // facts is Some iff the transcript existed and was readable (TailCache::read).
             facts.sessions.push((
                 s.file.name.clone(),
-                telemetry
-                    .facts
-                    .as_ref()
-                    .is_some_and(|f| f != &crate::telemetry::TailFacts::default())
-                    || telemetry.secs_since_append.is_some(),
+                telemetry.facts.is_some(),
                 s.account.is_some(),
                 pane.is_some(),
             ));
         }
         facts
     })
-    .await
-    .unwrap_or_default();
+    .await;
+    // A crashed scan task must not render as a clean, empty fleet with exit 0.
+    let Ok(facts) = facts else {
+        return ("fleet doctor: scan task failed\n".to_string(), false);
+    };
 
     let scan_ok = !facts.scan.dir_unreadable;
     (render_report(&facts), scan_ok)
@@ -207,6 +213,7 @@ mod tests {
             },
             versions: ["2.1.206".to_string()].into(),
             sessions: vec![("fleetops".to_string(), true, true, true)],
+            exact_panes: 1,
             wezterm: Ok(23),
             instances: 2,
             ..DoctorFacts::default()
@@ -215,6 +222,8 @@ mod tests {
         assert!(report.contains("36 total · 16 live · 20 stale-dead · 0 parse-failed"));
         assert!(report.contains("all known"));
         assert!(report.contains("2.1.206"));
+        // Spec 005: the pane-identity adoption line.
+        assert!(report.contains("pane identity: 1 of 1 sessions exact (WSLENV WEZTERM_PANE)"));
         assert!(report.contains("2 instances · 23 Claude panes"));
         assert!(report.contains("✓ transcript · ✓ account · ✓ pane — fleetops"));
         assert!(!report.contains('⚠'));
@@ -233,12 +242,17 @@ mod tests {
             unknown_statuses: ["pondering".to_string()].into(),
             sessions: vec![("mystery".to_string(), false, false, false)],
             wezterm: Err("wezterm.exe: timed out after 5s".to_string()),
+            instance_error: Some("gui-sock-3428: timed out after 5s".to_string()),
             ..DoctorFacts::default()
         };
         let report = render_report(&facts);
         assert!(report.contains("parse failures"));
         assert!(report.contains("pondering"));
         assert!(report.contains("wezterm unreachable"));
+        assert!(
+            report.contains("instance degraded"),
+            "partial pane list is a drift class"
+        );
         assert!(report.contains("✗ transcript · ✗ account · ✗ pane — mystery"));
     }
 

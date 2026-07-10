@@ -23,7 +23,7 @@ pub enum AppError {
     /// An external command failed to spawn or exited non-zero.
     #[error("{program}: {message}")]
     Subprocess {
-        /// argv[0] of the failing command.
+        /// `argv[0]` of the failing command.
         program: String,
         /// Short, secret-free failure summary.
         message: String,
@@ -32,7 +32,7 @@ pub enum AppError {
     /// An external command exceeded its timeout.
     #[error("{program}: timed out after {seconds}s")]
     Timeout {
-        /// argv[0] of the timed-out command.
+        /// `argv[0]` of the timed-out command.
         program: String,
         /// The timeout that elapsed.
         seconds: u64,

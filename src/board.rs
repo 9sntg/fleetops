@@ -67,7 +67,8 @@ impl MatchedPane {
 }
 
 /// Match a session to a wezterm pane. Priority (spec 005):
-/// 1. exact — the session's own `WEZTERM_PANE` (WSLENV-forwarded), if that pane still exists;
+/// 1. exact — the session's own `WEZTERM_PANE` (WSLENV-forwarded), if that pane still exists
+///    and its id is unique across instances (a cross-instance collision falls through);
 /// 2. title (verified live: WSL panes report the Windows cwd `file:///C:/Users/user/` — OSC7
 ///    cwd never crosses from WSL, only titles do);
 /// 3. cwd, for the rare pane whose cwd did cross. Returns `(pane, ambiguous)`.
@@ -77,11 +78,16 @@ pub fn match_pane(
     names: &[&str],
     panes: &[PaneRow],
 ) -> (Option<MatchedPane>, bool) {
+    // Pane ids are only unique WITHIN a wezterm instance (panes.rs) — a cross-instance id
+    // collision must fall through to the tie-breaks below, never guess by list order.
+    let mut env_collision = false;
     if let Some(id) = env_pane {
-        if let Some(p) = panes.iter().find(|p| p.pane_id == id) {
-            return (Some(MatchedPane::from_pane(p)), false); // exact identity, never ambiguous
+        let hits: Vec<&PaneRow> = panes.iter().filter(|p| p.pane_id == id).collect();
+        match hits.as_slice() {
+            [only] => return (Some(MatchedPane::from_pane(only)), false), // exact identity
+            [] => {} // env pane gone from the list (pane closed) — fall through
+            [_, ..] => env_collision = true,
         }
-        // env pane gone from the list (pane closed / other window) — fall through.
     }
     let by_title: Vec<&PaneRow> = panes
         .iter()
@@ -94,7 +100,7 @@ pub fn match_pane(
     }
     let by_cwd: Vec<&PaneRow> = panes.iter().filter(|p| p.cwd == cwd).collect();
     match by_cwd.as_slice() {
-        [] => (None, false),
+        [] => (None, env_collision), // an unresolved env-id collision IS ambiguity
         [only] => (Some(MatchedPane::from_pane(only)), false),
         [_, ..] => (None, true),
     }
@@ -259,6 +265,49 @@ mod tests {
         assert_eq!(match_pane(None, "/b", &["nomatch"], &panes), (None, true));
         // nothing matches
         assert_eq!(match_pane(None, "/z", &["x"], &panes), (None, false));
+    }
+
+    #[test]
+    fn env_pane_id_collision_across_instances_is_tiebroken_never_guessed() {
+        // pane ids are only unique WITHIN a wezterm instance — two instances both have pane 5.
+        let mut a = pane(5, "/a", "alpha");
+        a.socket = "C:\\sock-a".to_string();
+        let mut b = pane(5, "/b", "beta");
+        b.socket = "C:\\sock-b".to_string();
+        let panes = [a, b];
+        // The title tie-break picks the right instance.
+        let (m, ambiguous) = match_pane(Some(5), "/z", &["beta"], &panes);
+        assert_eq!(
+            m.map(|p| p.socket),
+            Some("C:\\sock-b".to_string()),
+            "collision resolved by title, not by list order"
+        );
+        assert!(!ambiguous);
+        // No tie-break possible → ambiguous, never a silent guess at the wrong window.
+        assert_eq!(
+            match_pane(Some(5), "/z", &["nomatch"], &panes),
+            (None, true)
+        );
+    }
+
+    #[test]
+    fn assemble_falls_back_to_native_name_on_empty_ai_title() {
+        // A transcript can carry an empty ai-title — the native name must win over "".
+        let sessions = [session("s1", "/a", "native", NativeStatus::Busy)];
+        let tel = [telemetry(
+            Some(TailFacts {
+                ai_title: Some(String::new()),
+                ..TailFacts::default()
+            }),
+            Some(1),
+        )];
+        let rows = assemble(&sessions, &tel, &[pane(3, "/z", "native")]);
+        assert_eq!(rows[0].name, "native");
+        assert_eq!(
+            rows[0].pane,
+            Some(matched(3)),
+            "pane still matches via native name"
+        );
     }
 
     #[test]

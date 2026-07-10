@@ -54,15 +54,7 @@ pub struct Telemetry {
 
 /// Claude Code's project-dir slug: every char outside `[A-Za-z0-9-]` becomes `-`.
 pub fn project_slug(cwd: &str) -> String {
-    cwd.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
+    cwd.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "-")
 }
 
 /// Path of a session's transcript.
@@ -75,7 +67,7 @@ pub fn transcript_path(projects_dir: &Path, cwd: &str, session_id: &str) -> Path
 /// ctx% used: context tokens as a percentage of the inferred window — 200k by default, 1M once
 /// usage exceeds 200k (a session can't legitimately sit over its own window; it would compact).
 /// Saturating: a hostile/corrupt usage value must never panic the draw (debug overflow checks).
-pub fn ctx_used_pct(context_tokens: u64) -> u64 {
+pub const fn ctx_used_pct(context_tokens: u64) -> u64 {
     let window = if context_tokens > CONTEXT_WINDOW {
         LARGE_CONTEXT_WINDOW
     } else {
@@ -191,12 +183,23 @@ impl TailCache {
         let stamp = (meta.len(), mtime);
         let facts = match self.entries.get(session_id) {
             Some((cached_stamp, cached)) if *cached_stamp == stamp => cached.clone(),
-            _ => {
-                let facts = read_tail_facts(&path, meta.len()).unwrap_or_default();
-                self.entries
-                    .insert(session_id.to_string(), (stamp, facts.clone()));
-                facts
-            }
+            _ => match read_tail_facts(&path, meta.len()) {
+                Some(facts) => {
+                    self.entries
+                        .insert(session_id.to_string(), (stamp, facts.clone()));
+                    facts
+                }
+                // Read failed after metadata succeeded (raced away / unreadable). Caching a
+                // default here would serve pending_question=false under this stamp FOREVER for
+                // a session blocked on a question (blocked = no appends = stamp never moves).
+                // Don't cache; the next poll retries.
+                None => {
+                    return Telemetry {
+                        facts: None,
+                        secs_since_append,
+                    }
+                }
+            },
         };
         Telemetry {
             facts: Some(facts),
@@ -313,6 +316,20 @@ mod tests {
     }
 
     #[test]
+    fn zero_usage_line_never_clobbers_an_earlier_real_count() {
+        // A later assistant line whose usage sums to 0 (only output_tokens, or explicit zeros)
+        // must keep the earlier real context count — and alone it proves nothing.
+        let zero = r#"{"type":"assistant","message":{"usage":{"output_tokens":42},"content":[]}}"#;
+        let jsonl = [assistant_usage(5, 5, 5), zero.to_string()].join("\n");
+        assert_eq!(
+            parse_tail(jsonl.as_bytes(), false).context_tokens,
+            Some(15),
+            "earlier real count survives a zero-usage line"
+        );
+        assert_eq!(parse_tail(zero.as_bytes(), false).context_tokens, None);
+    }
+
+    #[test]
     fn format_tokens_table() {
         let cases = [
             (0, "0"),
@@ -379,6 +396,29 @@ mod tests {
         // Missing transcript → default telemetry.
         let missing = cache.read(&tmp, "/w", "other-sid");
         assert_eq!(missing, Telemetry::default());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn failed_read_is_not_cached_as_an_empty_transcript() {
+        let tmp = std::env::temp_dir().join(format!("fleet-tel-badread-{}", std::process::id()));
+        let project = tmp.join(project_slug("/w"));
+        // A DIRECTORY where the transcript should be: metadata succeeds, reading fails.
+        std::fs::create_dir_all(project.join("sid.jsonl")).unwrap();
+
+        let mut cache = TailCache::default();
+        let t = cache.read(&tmp, "/w", "sid");
+        assert_eq!(
+            t.facts, None,
+            "a failed read must not masquerade as an empty transcript"
+        );
+
+        // Once readable, the next poll picks up the real facts (nothing poisoned the cache).
+        std::fs::remove_dir_all(project.join("sid.jsonl")).unwrap();
+        std::fs::write(project.join("sid.jsonl"), assistant_usage(1, 2, 3)).unwrap();
+        let healed = cache.read(&tmp, "/w", "sid");
+        assert_eq!(healed.facts.as_ref().unwrap().context_tokens, Some(6));
 
         std::fs::remove_dir_all(&tmp).ok();
     }

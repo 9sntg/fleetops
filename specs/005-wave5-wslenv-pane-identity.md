@@ -19,11 +19,14 @@ starts working.
   `LiveSession.wezterm_pane: Option<u64>`.
 - Match priority (first hit wins):
   1. **exact** — env pane id present AND that pane exists in the wezterm list (guards dead
-     panes / other windows); never ambiguous;
+     panes / other windows) AND its id is unique across instances — pane ids are per-instance,
+     so a cross-instance collision falls through to title/cwd; unresolved, it reads ambiguous
+     (`≈?`), never a silent guess at the wrong window;
   2. title (ai-title or native name), unique or ambiguous as before;
   3. cwd fallback.
 - Sessions started before the wezterm restart have no env pane id — graceful title/cwd fallback.
-- doctor: new line `pane identity: N exact (WSLENV) · M fallback-matched · K unmatched`.
+- doctor: new line `pane identity: N of M sessions exact (WSLENV WEZTERM_PANE)` (as shipped —
+  fallback/unmatched detail already lives in the per-session ✓/✗ lines).
 
 ## Seams & tests
 

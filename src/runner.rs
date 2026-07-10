@@ -13,8 +13,8 @@
 //! Design constraints:
 //! - Never build a shell string — always explicit argv (see rules/rust/subprocess-safety.md).
 //! - Every external call is bounded by a timeout; a hung child must never freeze the loop.
-//! - Ported from tokenomics src/runner.rs (proven, same house style); env overrides dropped
-//!   until a sensor needs them.
+//! - Ported from tokenomics src/runner.rs (proven, same house style); env overrides carry the
+//!   per-instance `WEZTERM_UNIX_SOCKET` + `WSLENV` targeting (wave 5).
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -26,7 +26,7 @@ use crate::error::{AppError, AppResult};
 /// A fully-specified external command. Built by pure argv builders, executed by a [`Runner`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
-    /// The program to run (argv[0]); resolved via `PATH`.
+    /// The program to run (`argv[0]`); resolved via `PATH`.
     pub program: String,
     /// The arguments (argv[1..]); explicit, never shell-parsed.
     pub args: Vec<String>,
@@ -133,6 +133,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exec_times_out_a_hung_child_promptly() {
+        // THE anti-freeze invariant: stale wezterm sockets HANG on connect; a hung child must
+        // never wedge a sweep. The call must return bounded, not after the child exits.
+        let started = std::time::Instant::now();
+        let mut hung = spec("sleep", &["5"]);
+        hung.timeout = Duration::from_millis(100);
+        let err = Exec.run(&hung).await.expect_err("must time out");
+        assert!(matches!(err, AppError::Timeout { .. }));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timeout bounds the call; kill_on_drop reaps the child"
+        );
+    }
+
+    #[tokio::test]
     async fn exec_reports_missing_program() {
         let err = Exec
             .run(&spec("fleet-no-such-program-xyz", &[]))
@@ -196,15 +211,19 @@ impl CannedRunner {
 #[async_trait]
 impl Runner for CannedRunner {
     async fn run(&self, spec: &CommandSpec) -> AppResult<Vec<u8>> {
-        let mut calls = self.calls.lock().expect("canned runner mutex");
-        calls.push(spec.clone());
-        let index = (calls.len() - 1).min(self.outputs.len() - 1);
-        match &self.outputs[index] {
-            Ok(bytes) => Ok(bytes.clone()),
-            Err(_) => Err(AppError::Subprocess {
-                program: spec.program.clone(),
-                message: "canned failure".to_string(),
-            }),
-        }
+        let index = {
+            let mut calls = self.calls.lock().expect("canned runner mutex");
+            calls.push(spec.clone());
+            (calls.len() - 1).min(self.outputs.len() - 1)
+        };
+        self.outputs[index].as_ref().map_or_else(
+            |_| {
+                Err(AppError::Subprocess {
+                    program: spec.program.clone(),
+                    message: "canned failure".to_string(),
+                })
+            },
+            |bytes| Ok(bytes.clone()),
+        )
     }
 }

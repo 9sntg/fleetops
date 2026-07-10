@@ -328,6 +328,27 @@ mod tests {
     }
 
     #[test]
+    fn live_session_without_environ_is_live_with_unknown_account() {
+        let tmp = std::env::temp_dir().join(format!("fleet-env-{}", std::process::id()));
+        let sessions = tmp.join("sessions");
+        let proc_root = tmp.join("proc");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&proc_root).unwrap();
+        std::fs::write(sessions.join("5.json"), session_json(5, "500", "busy")).unwrap();
+        fake_proc(&proc_root, 5, "500", None); // stat readable, environ absent
+
+        let (live, stats) = scan(&sessions, &proc_root);
+        std::fs::remove_dir_all(&tmp).ok();
+
+        assert_eq!(
+            stats.live, 1,
+            "unreadable environ never drops a live session"
+        );
+        assert_eq!(live[0].account, None, "absent → unknown, not error");
+        assert_eq!(live[0].wezterm_pane, None);
+    }
+
+    #[test]
     fn scan_of_missing_dir_is_flagged_not_a_silent_empty_fleet() {
         let (live, stats) = scan(Path::new("/nonexistent-fleet-dir"), Path::new("/proc"));
         assert!(live.is_empty());

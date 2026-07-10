@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+- **Strictest-lints pass + 22-finding review sweep** (code-reviewer + code-simplifier plugins,
+  4 review dimensions, adversarial verification; all confirmed findings applied TDD-style):
+  - Lint gate hardened: clippy `nursery` + `cargo` groups and `missing_docs` now deny; rustdoc
+    `-D warnings` added to `check.sh`; crossterm pinned to ratatui's 0.28 (one copy links);
+    `cargo audit` clean (2 transitive warnings via ratatui, code paths unused).
+  - **Exact pane match instance-aware**: `WEZTERM_PANE` ids are only unique per wezterm
+    instance — a cross-instance id collision now falls through to title/cwd (unresolved → `≈?`)
+    instead of silently jumping to the wrong window's pane.
+  - **Partial instance failure surfaces**: one wezterm instance failing no longer returns a
+    silent partial pane list — the footer/doctor report the degraded instance, and the partial
+    list never overwrites the last-good pane cache (stale-beats-blank now holds for the exact
+    failure class it was built for).
+  - `--no-auto-start` on every wezterm cli call (a socketless sweep must error, not spawn a mux
+    server); drvfs socket stats moved off async workers; manual-refresh autorepeat coalesced;
+    transient transcript read failures are no longer cached as "empty transcript" (could hide a
+    pending question forever); terminal restore failure and event-stream death no longer exit
+    silently with success; footer counts unparseable session files; ACCT column fits 8-char
+    accounts; doctor: scan-task crash exits 1, spec-005 pane-identity line pinned by test.
+  - New tests: Exec timeout bound (the anti-freeze invariant), zero-usage clobber-guard,
+    environ-less live session, cache heal-after-failed-read, merge/fold partial-failure tables.
+
 - **Multi-instance wezterm sensor** — root cause of the empty TAB/PANE board: two wezterm-gui
   processes run (main + TUI monitor), and a `cli` call only answers from the instance owning
   the invoking pane, so fleet on the monitor saw zero Claude panes. Fleet now discovers every
