@@ -1,29 +1,41 @@
-# Fleetops — verified data sources (recon 2026-07-10)
+# Fleetops — verified data sources
 
-Facts checked on this machine before architecture. Each row was verified live, not assumed.
+> Recon 2026-07-10 on this machine (Claude Code v2.1.206). Superseded in depth by
+> `plans/001-fleetops-architecture/01-deep-dive.md` (D1–D9 + assumption log) — this file is the
+> short index. Initial version contained errors, corrected below after live verification.
 
 ## What the tool must show, and where it comes from
 
-| Need | Source | Verified |
+| Need | Source | Status |
 |---|---|---|
-| Status: working / done / needs input | Claude Code hooks already fire per session: `UserPromptSubmit → working`, `Notification → input`, `Stop → done`, `SessionEnd → clear` via `~/.claude/helpers/claude-wezterm-status.sh` (sets wezterm user var `CLAUDE_STATUS` over OSC 1337 on `$WEZTERM_PANE`) | ✅ script read |
-| Context %, cost, tokens, model | `~/.claude/helpers/statusline.mjs` — statusline command receives full JSON every render tick | ✅ exists |
-| Token usage, cwd, git branch, message history | Session transcripts: `~/.claude-acct/<acct>/projects/<cwd-slug>/<session-uuid>.jsonl` — entries carry `sessionId`, `cwd`, `gitBranch`, usage, `stop_hook_summary`, `turn_duration` | ✅ tail-read |
-| Semantic session name | Claude Code writes `summary` entries into the session JSONL; fallback: one cheap Haiku call per session. **No embeddings needed** | partially (summary entries known from format; verify per-version) |
-| Pane mapping / jump-to-session | `wezterm.exe cli list --format json` (Windows wezterm, works from WSL); `activate-pane` to jump | ✅ binary at `/mnt/c/Program Files/WezTerm/wezterm.exe` |
+| Live-session discovery + busy/idle + name | **`~/.claude/sessions/<pid>.json`** — Claude Code natively maintains `{pid, sessionId, cwd, procStart, name, status: busy\|idle\|shell, updatedAt}`. ⚠️ leaves stale files for dead PIDs → liveness = `/proc/<pid>` + procStart match | ✅ verified (KEY FINDING) |
+| Tokens, context %, semantic title, pending question | Transcript JSONL `~/.claude/projects/<slug>/<uuid>.jsonl`: `usage` on assistant lines (ctx% recipe = input+cache_read+cache_creation vs 200k/1M), **`ai-title` entries** (NOT `summary` — those don't exist in v2.1.x), pending `AskUserQuestion` tool_use. Permission prompts are **never** in JSONL | ✅ verified |
+| Instant transitions + permission prompts | Hooks (`async:true`): UserPromptSubmit carries `{prompt, session_title}`, Notification `{notification_type: permission_prompt\|idle_prompt, message}`, Stop `{last_assistant_message}`, SessionEnd. No hook covers AskUserQuestion (anthropic #13024) | ✅ payloads binary-verified |
+| Pane mapping / jump | `wezterm.exe cli list --format json` (median 110 ms from WSL): pane `title` already carries Claude's live title + status glyph (⠂ working / ✳ idle), `cwd` matches session cwd. `activate-pane` to jump. No user-vars readable via CLI | ✅ verified |
+| Account attribution | `/proc/<pid>/environ` → `CLAUDE_CONFIG_DIR`, `CLAUDE_ACCOUNT` (transcript paths carry no identity) | ✅ verified |
+| Fallback name | `~/.claude/history.jsonl` `{display, sessionId, project, timestamp}` — free; Haiku call (~$0.0011) only as last resort | ✅ verified |
 
-## Constraints discovered
+## Corrections vs initial recon (2026-07-10)
 
-- **Multiple accounts**: sessions live under `~/.claude-acct/*/projects/` (gmail seen; others likely) —
-  fleet discovery must scan all account dirs, not one.
-- Statusline runs only on render ticks → an idle session's numbers go stale; hooks cover the
-  transitions (done/needs-input), so staleness only affects tokens/context of idle sessions.
-- Hook script writes to `/dev/tty` (wezterm user var), not to any file — a file/store lane for
-  fleetops would be an **addition** (extra hook arg or second hook), not a replacement.
-- `claude-wezterm-status.sh` no-ops outside wezterm (`$WEZTERM_PANE` guard).
+1. **`WEZTERM_PANE` never reaches WSL** (WSLENV forwards only TERM vars) — the existing
+   `claude-wezterm-status.sh` hook chain is a verified **no-op** on every session (guard exits).
+   The wezterm tab icons the maintainer configured have never fired from WSL sessions.
+2. **One unified store**: every `~/.claude-acct/<acct>/{projects,sessions}` is a symlink to
+   `~/.claude/{projects,sessions}` — fleet discovery scans ONE dir; multi-account is a non-problem
+   for discovery (but attribution needs /proc).
+3. **No `"type":"summary"` entries** exist (checked all 3,866 transcripts) — semantic names come
+   from `ai-title` entries / `history.jsonl` / hook `session_title`.
+4. **Statusline input JSON** (official docs 2026-07-09) now includes `context_window.used_percentage`,
+   `rate_limits`, `session_name` — richer than assumed; local `statusline.mjs` still self-computes.
+
+## Scale facts
+
+3,866 transcript JSONLs total; ~42 modified/24 h; ~17 concurrent sessions typical; sizes p50 214 KB,
+p90 732 KB, max 22.3 MB. All on ext4 (inotify reliable; watch dirs not files). `usage.output_tokens`
+is a mid-stream snapshot (undercounts ~2×, #27361) — tokens are approximate, never billing-truth.
 
 ## Prior art in `/tui`
 
-- `tokenomics` — per-account usage/limits TUI (Rust + ratatui + tokio + rusqlite WAL; collector
-  writes, TUI reads). Fleetops decree: same shape, per-session instead of per-account.
-- `ghmonitor`, `ground-control`, `bridge` — sibling TUIs; check for reusable patterns.
+- `tokenomics` — per-account (fleetops = per-session); collector+SQLite+MVU patterns to port.
+- `bridge` — **hub pattern**: many async source tasks → normalized events → one stream → TUI; ndjson codec.
+- `ground-control` — same MVU + subprocess-safety shape. `ghmonitor` — Go, UX reference only.
