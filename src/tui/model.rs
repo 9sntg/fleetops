@@ -14,7 +14,7 @@
 //! - Pure: no clocks, no subprocess, no terminal. Age is counted in ticks fed by the loop.
 //! - Selection is keyed by `session_id`, not row index — a refresh must not steal the cursor.
 
-use crate::board::SessionRow;
+use crate::board::{MatchedPane, SessionRow};
 use crate::discovery::ScanStats;
 
 /// User intent, mapped from keys (see `keys.rs`).
@@ -75,9 +75,9 @@ pub struct App {
     pub error: Option<String>,
     /// Loop flag: exit.
     pub should_quit: bool,
-    /// Effect request: jump to this `(tab_id, pane_id)` (drained by the loop) — the tab must
-    /// be activated too, activate-pane alone doesn't bring the tab forward.
-    pub pending_jump: Option<(u64, u64)>,
+    /// Effect request: jump to this pane (drained by the loop) — activate the tab too (pane
+    /// activation alone doesn't bring the tab forward), against the pane's own instance.
+    pub pending_jump: Option<MatchedPane>,
     /// Effect request: poll the sensors now (drained by the loop).
     pub refresh_requested: bool,
     /// Seq of the newest applied snapshot; older arrivals are dropped.
@@ -138,8 +138,8 @@ impl App {
                     return;
                 };
                 let row = &self.rows[index];
-                match row.pane {
-                    Some(p) => self.pending_jump = Some((p.tab_id, p.pane_id)),
+                match &row.pane {
+                    Some(p) => self.pending_jump = Some(p.clone()),
                     None if row.pane_ambiguous => {
                         self.error = Some(format!("jump: several panes match '{}'", row.name));
                     }
@@ -180,6 +180,7 @@ mod tests {
             context_tokens: Some(50_000),
             secs_since_append: Some(3),
             pane: pane.map(|(tab_id, pane_id)| MatchedPane {
+                socket: String::new(),
                 tab_id,
                 pane_id,
                 tab_index: 1,
@@ -261,7 +262,7 @@ mod tests {
         let mut app = app_with(&["a"]);
         app.update(Msg::Key(Action::Jump));
         assert_eq!(
-            app.pending_jump,
+            app.pending_jump.as_ref().map(|p| (p.tab_id, p.pane_id)),
             Some((1, 9)),
             "tab id needed to bring the tab forward"
         );

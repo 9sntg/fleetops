@@ -98,8 +98,8 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal) -> AppResult<()> {
             sweep_seq += 1;
             spawn_sweep(&runner, &cache, &tx, sweep_seq);
         }
-        if let Some((tab_id, pane_id)) = app.pending_jump.take() {
-            spawn_jump(&runner, &tx, tab_id, pane_id);
+        if let Some(target) = app.pending_jump.take() {
+            spawn_jump(&runner, &tx, target);
         }
         if app.should_quit {
             break;
@@ -134,7 +134,7 @@ fn spawn_sweep(
 /// A degraded wezterm lane is a `lane_error`, not a failure — session rows still ship, and the
 /// LAST GOOD pane list keeps TAB/PANE matches alive (stale beats blank; the footer says so).
 async fn sweep(runner: &dyn Runner, cache: &Arc<Mutex<SweepCaches>>) -> Result<Snapshot, String> {
-    let panes_result = panes::list_panes(runner).await;
+    let panes_result = panes::list_all_panes(runner).await;
     let cache = Arc::clone(cache);
     tokio::task::spawn_blocking(move || {
         let claude_dir = paths::claude_dir();
@@ -168,13 +168,18 @@ async fn sweep(runner: &dyn Runner, cache: &Arc<Mutex<SweepCaches>>) -> Result<S
 
 /// Fire the jump off the UI task; only failures surface (as a footer `Msg::Error`).
 /// Tab first, then pane: activate-pane alone focuses within a tab but doesn't switch tabs.
-fn spawn_jump(runner: &Arc<dyn Runner>, tx: &mpsc::Sender<Msg>, tab_id: u64, pane_id: u64) {
+/// Both commands target the pane's own wezterm instance via its socket.
+fn spawn_jump(runner: &Arc<dyn Runner>, tx: &mpsc::Sender<Msg>, target: board::MatchedPane) {
     let runner = Arc::clone(runner);
     let tx = tx.clone();
     tokio::spawn(async move {
         let result = async {
-            runner.run(&panes::activate_tab_spec(tab_id)).await?;
-            runner.run(&panes::activate_pane_spec(pane_id)).await
+            runner
+                .run(&panes::activate_tab_spec(&target.socket, target.tab_id))
+                .await?;
+            runner
+                .run(&panes::activate_pane_spec(&target.socket, target.pane_id))
+                .await
         }
         .await;
         if let Err(e) = result {

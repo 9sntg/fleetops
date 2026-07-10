@@ -30,6 +30,9 @@ pub struct CommandSpec {
     pub program: String,
     /// The arguments (argv[1..]); explicit, never shell-parsed.
     pub args: Vec<String>,
+    /// Environment overrides layered onto the inherited environment (e.g. the WSLENV-forwarded
+    /// `WEZTERM_UNIX_SOCKET` that targets one specific wezterm instance).
+    pub env: Vec<(String, String)>,
     /// Hard per-call timeout.
     pub timeout: Duration,
 }
@@ -50,6 +53,9 @@ impl Runner for Exec {
     async fn run(&self, spec: &CommandSpec) -> AppResult<Vec<u8>> {
         let mut cmd = tokio::process::Command::new(&spec.program);
         cmd.args(&spec.args);
+        for (key, value) in &spec.env {
+            cmd.env(key, value);
+        }
         // No stdin: a child that waits on input must never wedge a sensor.
         cmd.stdin(Stdio::null());
         // Reap a timed-out child: on timeout the future is dropped, and kill_on_drop kills the
@@ -103,6 +109,7 @@ mod tests {
         CommandSpec {
             program: program.to_string(),
             args: args.iter().map(|s| (*s).to_string()).collect(),
+            env: Vec::new(),
             timeout: Duration::from_secs(5),
         }
     }
@@ -142,13 +149,13 @@ mod tests {
     }
 }
 
-/// A test seam that returns canned bytes and records the last spec it was handed — so sensor
-/// parsing is tested with no process spawn. Test-only (never compiled into the binary).
+/// A test seam that returns canned outputs (in order, last repeats) and records every spec it
+/// was handed — so sensor parsing is tested with no process spawn. Test-only.
 #[cfg(test)]
 #[derive(Debug)]
 pub struct CannedRunner {
-    output: Vec<u8>,
-    last: std::sync::Mutex<Option<CommandSpec>>,
+    outputs: Vec<AppResult<Vec<u8>>>,
+    calls: std::sync::Mutex<Vec<CommandSpec>>,
 }
 
 #[cfg(test)]
@@ -156,14 +163,32 @@ impl CannedRunner {
     /// Build a runner that always returns `output` and records each spec.
     pub fn new(output: impl Into<Vec<u8>>) -> Self {
         Self {
-            output: output.into(),
-            last: std::sync::Mutex::new(None),
+            outputs: vec![Ok(output.into())],
+            calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Build a runner that returns `outputs` in call order (the last one repeats).
+    pub fn new_seq(outputs: Vec<AppResult<Vec<u8>>>) -> Self {
+        assert!(!outputs.is_empty(), "need at least one canned output");
+        Self {
+            outputs,
+            calls: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     /// The most recent spec passed to `run`, if any.
     pub fn last_spec(&self) -> Option<CommandSpec> {
-        self.last.lock().expect("canned runner mutex").clone()
+        self.calls
+            .lock()
+            .expect("canned runner mutex")
+            .last()
+            .cloned()
+    }
+
+    /// Every spec passed to `run`, in call order.
+    pub fn all_specs(&self) -> Vec<CommandSpec> {
+        self.calls.lock().expect("canned runner mutex").clone()
     }
 }
 
@@ -171,7 +196,15 @@ impl CannedRunner {
 #[async_trait]
 impl Runner for CannedRunner {
     async fn run(&self, spec: &CommandSpec) -> AppResult<Vec<u8>> {
-        *self.last.lock().expect("canned runner mutex") = Some(spec.clone());
-        Ok(self.output.clone())
+        let mut calls = self.calls.lock().expect("canned runner mutex");
+        calls.push(spec.clone());
+        let index = (calls.len() - 1).min(self.outputs.len() - 1);
+        match &self.outputs[index] {
+            Ok(bytes) => Ok(bytes.clone()),
+            Err(_) => Err(AppError::Subprocess {
+                program: spec.program.clone(),
+                message: "canned failure".to_string(),
+            }),
+        }
     }
 }

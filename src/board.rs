@@ -42,9 +42,11 @@ pub struct SessionRow {
     pub pane_ambiguous: bool,
 }
 
-/// The pane a session resolved to: ids for the jump, tab position for the board.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The pane a session resolved to: instance + ids for the jump, tab position for the board.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchedPane {
+    /// Windows-form socket of the owning wezterm instance ("" = invoker's own).
+    pub socket: String,
     /// wezterm tab id (jump: activate-tab).
     pub tab_id: u64,
     /// wezterm pane id (jump: activate-pane).
@@ -56,6 +58,7 @@ pub struct MatchedPane {
 impl MatchedPane {
     fn from_pane(p: &PaneRow) -> Self {
         Self {
+            socket: p.socket.clone(),
             tab_id: p.tab_id,
             pane_id: p.pane_id,
             tab_index: p.tab_index,
@@ -170,6 +173,7 @@ mod tests {
 
     fn pane(pane_id: u64, cwd: &str, name: &str) -> PaneRow {
         PaneRow {
+            socket: "C:\\sock".to_string(),
             pane_id,
             tab_id: 1,
             tab_index: 1,
@@ -182,6 +186,7 @@ mod tests {
 
     fn matched(pane_id: u64) -> MatchedPane {
         MatchedPane {
+            socket: "C:\\sock".to_string(),
             tab_id: 1,
             pane_id,
             tab_index: 1,

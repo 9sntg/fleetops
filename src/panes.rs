@@ -6,14 +6,20 @@
 //! Tested:  inline `#[cfg(test)]` against tests/fixtures/wezterm-list.json (captured live 2026-07-10)
 //!
 //! Key responsibilities:
-//! - Parse `wezterm.exe cli list --format json` output tolerantly (unknown fields skipped).
-//! - Classify pane titles: braille spinner = Working, `✳` = Idle, else not a Claude pane.
-//! - Shorten `file://` cwd URLs for display; build `list` / `activate-pane` argv (pure).
+//! - Discover ALL live wezterm instances (tasklist PIDs × gui-sock-<pid> files) — a `cli`
+//!   call answers only from the instance owning the invoking pane's interop, so fleet running
+//!   on the TUI monitor sees zero Claude panes unless each instance is targeted explicitly
+//!   via a WSLENV-forwarded `WEZTERM_UNIX_SOCKET` (verified live 2026-07-10; flag `/w`).
+//! - Parse `cli list --format json` tolerantly; classify titles (braille spinner = Working,
+//!   `✳` = Idle, else not a Claude pane); merge instances; per-instance tab-bar numbering.
+//! - Build `list` / `activate-tab` / `activate-pane` argv+env (pure).
 //!
 //! Design constraints:
 //! - Glyph convention is undocumented (dossier assumption A2): classification must stay a pure
 //!   table-tested function so a format change is a one-function fix.
-//! - Read-only over the fleet: the only mutating verb built here is `activate-pane` (focus).
+//! - Stale gui-sock files HANG on connect (verified) — only tasklist-live PIDs are queried,
+//!   every call stays timeout-bounded.
+//! - Read-only over the fleet: the only mutating verbs are activate-tab/-pane (focus).
 
 use std::time::Duration;
 
@@ -34,6 +40,9 @@ pub enum PaneStatus {
 /// One Claude pane row on the board.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneRow {
+    /// Windows-form socket path of the owning wezterm instance (empty = invoker's own) —
+    /// pane/tab ids are only unique WITHIN an instance, and jumps must target the right one.
+    pub socket: String,
     /// wezterm pane id — identity and jump target.
     pub pane_id: u64,
     /// wezterm tab id — display grouping.
@@ -127,6 +136,95 @@ fn wezterm_program() -> String {
         .clone()
 }
 
+/// Where wezterm instance sockets live, WSL- and Windows-form. This box's layout (single-user
+/// tool); doctor prints what was found there.
+const SOCK_DIR_WSL: &str = "/mnt/c/Users/user/.local/share/wezterm";
+const SOCK_DIR_WIN: &str = "C:\\Users\\user\\.local\\share\\wezterm";
+
+/// argv for `tasklist.exe` filtered to wezterm-gui processes, CSV form.
+pub fn tasklist_args() -> Vec<String> {
+    ["/FI", "IMAGENAME eq wezterm-gui.exe", "/FO", "CSV"]
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Build the bounded `tasklist.exe` command.
+pub fn tasklist_spec() -> CommandSpec {
+    CommandSpec {
+        program: "tasklist.exe".to_string(),
+        args: tasklist_args(),
+        env: Vec::new(),
+        timeout: Duration::from_secs(5),
+    }
+}
+
+/// Parse tasklist CSV → wezterm-gui PIDs. Tolerant: malformed lines skipped.
+pub fn parse_tasklist_pids(bytes: &[u8]) -> Vec<u32> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split("\",\"");
+            let image = fields.next()?.trim_start_matches('"');
+            if !image.eq_ignore_ascii_case("wezterm-gui.exe") {
+                return None;
+            }
+            fields.next()?.parse().ok()
+        })
+        .collect()
+}
+
+/// The env pair that targets one wezterm instance from WSL: the socket var itself plus a
+/// per-process WSLENV telling interop to forward it (flag `/w` = WSL→Win32 direction).
+fn socket_env(socket_win: &str) -> Vec<(String, String)> {
+    vec![
+        ("WEZTERM_UNIX_SOCKET".to_string(), socket_win.to_string()),
+        ("WSLENV".to_string(), "WEZTERM_UNIX_SOCKET/w".to_string()),
+    ]
+}
+
+/// Discover live instances: tasklist PIDs whose `gui-sock-<pid>` file exists.
+/// Dead PIDs' stale socket files HANG on connect — this filter is load-bearing.
+pub async fn discover_sockets(runner: &dyn Runner) -> AppResult<Vec<String>> {
+    let bytes = runner.run(&tasklist_spec()).await?;
+    let pids = parse_tasklist_pids(&bytes);
+    Ok(pids
+        .into_iter()
+        .filter(|pid| {
+            std::path::Path::new(SOCK_DIR_WSL)
+                .join(format!("gui-sock-{pid}"))
+                .is_file()
+        })
+        .map(|pid| format!("{SOCK_DIR_WIN}\\gui-sock-{pid}"))
+        .collect())
+}
+
+/// Query every live instance and merge their Claude panes. Degrades per instance: one failing
+/// instance is skipped; only total failure (or discovery failure) is an error.
+pub async fn list_all_panes(runner: &dyn Runner) -> AppResult<Vec<PaneRow>> {
+    let sockets = discover_sockets(runner).await?;
+    if sockets.is_empty() {
+        // No instance discovered (tasklist empty?) — fall back to the invoker's own instance.
+        return list_panes(runner, "").await;
+    }
+    let queries = sockets.iter().map(|s| list_panes(runner, s));
+    let results = futures::future::join_all(queries).await;
+    let mut merged = Vec::new();
+    let mut last_err = None;
+    for result in results {
+        match result {
+            Ok(mut rows) => merged.append(&mut rows),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if merged.is_empty() {
+        if let Some(e) = last_err {
+            return Err(e);
+        }
+    }
+    Ok(merged)
+}
+
 /// Last-good pane list: a wezterm lane error must not blank the board's TAB/PANE columns —
 /// stale matches (with the error in the footer) beat no matches.
 #[derive(Debug, Default)]
@@ -148,42 +246,57 @@ impl PaneCache {
     }
 }
 
-/// Build the bounded `cli list` command.
-pub fn list_spec() -> CommandSpec {
+/// Build the bounded `cli list` command against one instance ("" = invoker's own).
+pub fn list_spec(socket_win: &str) -> CommandSpec {
     CommandSpec {
         program: wezterm_program(),
         args: list_args(),
+        env: if socket_win.is_empty() {
+            Vec::new()
+        } else {
+            socket_env(socket_win)
+        },
         timeout: Duration::from_secs(5),
     }
 }
 
-/// Build the bounded `activate-pane` command.
-pub fn activate_pane_spec(pane_id: u64) -> CommandSpec {
+/// Build the bounded `activate-pane` command against the pane's instance.
+pub fn activate_pane_spec(socket_win: &str, pane_id: u64) -> CommandSpec {
     CommandSpec {
         program: wezterm_program(),
         args: activate_pane_args(pane_id),
+        env: if socket_win.is_empty() {
+            Vec::new()
+        } else {
+            socket_env(socket_win)
+        },
         timeout: Duration::from_secs(5),
     }
 }
 
-/// Build the bounded `activate-tab` command.
-pub fn activate_tab_spec(tab_id: u64) -> CommandSpec {
+/// Build the bounded `activate-tab` command against the pane's instance.
+pub fn activate_tab_spec(socket_win: &str, tab_id: u64) -> CommandSpec {
     CommandSpec {
         program: wezterm_program(),
         args: activate_tab_args(tab_id),
+        env: if socket_win.is_empty() {
+            Vec::new()
+        } else {
+            socket_env(socket_win)
+        },
         timeout: Duration::from_secs(5),
     }
 }
 
-/// Run `cli list` via `runner` and return the Claude pane rows, sorted by `pane_id`.
-pub async fn list_panes(runner: &dyn Runner) -> AppResult<Vec<PaneRow>> {
-    let bytes = runner.run(&list_spec()).await?;
-    parse_pane_list(&bytes)
+/// Run `cli list` against one instance and return its Claude pane rows, sorted by `pane_id`.
+pub async fn list_panes(runner: &dyn Runner, socket_win: &str) -> AppResult<Vec<PaneRow>> {
+    let bytes = runner.run(&list_spec(socket_win)).await?;
+    parse_pane_list(&bytes, socket_win)
 }
 
 /// Parse `cli list --format json` bytes into Claude pane rows, sorted by `pane_id`.
-/// Non-Claude panes (no recognized glyph) are excluded.
-pub fn parse_pane_list(bytes: &[u8]) -> AppResult<Vec<PaneRow>> {
+/// Non-Claude panes (no recognized glyph) are excluded; rows are stamped with their instance.
+pub fn parse_pane_list(bytes: &[u8], socket_win: &str) -> AppResult<Vec<PaneRow>> {
     let raw: Vec<RawPane> =
         serde_json::from_slice(bytes).map_err(|e| AppError::Parse(format!("wezterm list: {e}")))?;
     // Tab-bar numbering: wezterm lists panes in window/tab order, so a tab's 1-based position
@@ -206,6 +319,7 @@ pub fn parse_pane_list(bytes: &[u8]) -> AppResult<Vec<PaneRow>> {
         .filter_map(|p| {
             let (status, name) = classify_title(&p.title)?;
             Some(PaneRow {
+                socket: socket_win.to_string(),
                 pane_id: p.pane_id,
                 tab_id: p.tab_id,
                 tab_index: tab_positions
@@ -262,7 +376,7 @@ mod tests {
 
     #[test]
     fn fixture_parses_to_claude_rows_only_sorted_by_pane_id() {
-        let rows = parse_pane_list(FIXTURE).expect("fixture parses");
+        let rows = parse_pane_list(FIXTURE, "").expect("fixture parses");
         assert!(!rows.is_empty(), "fixture has Claude panes");
         assert!(rows.windows(2).all(|w| w[0].pane_id < w[1].pane_id));
         // The fixture contains wslhost.exe and empty-title panes — none may survive.
@@ -271,7 +385,7 @@ mod tests {
 
     #[test]
     fn fixture_row_fields_are_extracted() {
-        let rows = parse_pane_list(FIXTURE).expect("fixture parses");
+        let rows = parse_pane_list(FIXTURE, "").expect("fixture parses");
         let fleet = rows
             .iter()
             .find(|r| r.name.contains("FleetOps"))
@@ -319,7 +433,7 @@ mod tests {
     #[test]
     fn unknown_fields_and_missing_optionals_are_tolerated() {
         let json = r#"[{"pane_id": 7, "tab_id": 1, "title": "⠢ x", "novel_field": {"a": 1}}]"#;
-        let rows = parse_pane_list(json.as_bytes()).expect("tolerant parse");
+        let rows = parse_pane_list(json.as_bytes(), "").expect("tolerant parse");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].pane_id, 7);
         assert_eq!(rows[0].cwd, "");
@@ -329,7 +443,7 @@ mod tests {
     #[test]
     fn garbage_input_is_a_parse_error() {
         assert!(matches!(
-            parse_pane_list(b"not json"),
+            parse_pane_list(b"not json", ""),
             Err(AppError::Parse(_))
         ));
     }
@@ -378,6 +492,7 @@ mod tests {
     fn pane_cache_keeps_last_good_list_on_lane_error() {
         let mut cache = PaneCache::default();
         let rows = vec![PaneRow {
+            socket: String::new(),
             pane_id: 1,
             tab_id: 1,
             tab_index: 1,
@@ -409,11 +524,51 @@ mod tests {
     #[tokio::test]
     async fn list_panes_runs_the_list_spec() {
         let runner = CannedRunner::new(FIXTURE.to_vec());
-        let rows = list_panes(&runner).await.expect("canned list parses");
+        let rows = list_panes(&runner, "").await.expect("canned list parses");
         assert!(!rows.is_empty());
         let spec = runner.last_spec().expect("spec recorded");
         // Program resolves via PATH or the absolute fallback depending on the test env.
         assert!(spec.program.ends_with(WEZTERM), "got {}", spec.program);
         assert_eq!(spec.args, list_args());
+    }
+
+    #[test]
+    fn tasklist_csv_parses_to_pids() {
+        let csv = b"\"Image Name\",\"PID\",\"Session Name\",\"Session#\",\"Mem Usage\"\r\n\
+\"wezterm-gui.exe\",\"18840\",\"Console\",\"1\",\"139,280 K\"\r\n\
+\"wezterm-gui.exe\",\"3428\",\"Console\",\"1\",\"218,680 K\"\r\n\
+garbage line\r\n";
+        assert_eq!(parse_tasklist_pids(csv), vec![18_840, 3_428]);
+        assert!(parse_tasklist_pids(b"INFO: No tasks are running.\r\n").is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_panes_stamps_rows_with_their_instance_and_targets_it() {
+        let runner = CannedRunner::new_seq(vec![Ok(FIXTURE.to_vec()), Ok(FIXTURE.to_vec())]);
+        let a = list_panes(&runner, "C:\\sock-a").await.expect("instance a");
+        let b = list_panes(&runner, "C:\\sock-b").await.expect("instance b");
+        assert!(a.iter().all(|p| p.socket == "C:\\sock-a"));
+        assert!(b.iter().all(|p| p.socket == "C:\\sock-b"));
+
+        let specs = runner.all_specs();
+        assert_eq!(specs.len(), 2);
+        // Each call carries the WSLENV-forwarded socket env targeting ITS instance.
+        assert_eq!(
+            specs[0].env,
+            vec![
+                ("WEZTERM_UNIX_SOCKET".to_string(), "C:\\sock-a".to_string()),
+                ("WSLENV".to_string(), "WEZTERM_UNIX_SOCKET/w".to_string()),
+            ]
+        );
+        assert_eq!(specs[1].env[0].1, "C:\\sock-b");
+    }
+
+    #[test]
+    fn jump_specs_carry_the_socket_env() {
+        let tab = activate_tab_spec("C:\\sock-a", 7);
+        assert_eq!(tab.args, ["cli", "activate-tab", "--tab-id", "7"]);
+        assert_eq!(tab.env[0].1, "C:\\sock-a");
+        let pane = activate_pane_spec("", 9);
+        assert!(pane.env.is_empty(), "own instance needs no socket env");
     }
 }

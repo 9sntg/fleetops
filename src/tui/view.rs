@@ -83,7 +83,7 @@ fn account_color(account: &str) -> Color {
 
 /// TAB cell: the 1-based tab-bar position (what the tab bar shows), `≈?`/`—` when unmatched.
 fn tab_cell(row: &SessionRow) -> String {
-    match (row.pane, row.pane_ambiguous) {
+    match (&row.pane, row.pane_ambiguous) {
         (Some(p), _) => p.tab_index.to_string(),
         (None, true) => "≈?".to_string(),
         (None, false) => "—".to_string(),
@@ -91,16 +91,50 @@ fn tab_cell(row: &SessionRow) -> String {
 }
 
 fn pane_cell(row: &SessionRow) -> String {
-    match (row.pane, row.pane_ambiguous) {
+    match (&row.pane, row.pane_ambiguous) {
         (Some(p), _) => p.pane_id.to_string(),
         (None, true) => "≈?".to_string(),
         (None, false) => "—".to_string(),
     }
 }
 
+/// Context gauge width in cells.
+const CTX_BAR_WIDTH: u64 = 10;
+
+/// Context gauge: filled blocks over the window, no percentage (visual per the maintainer's ask).
+fn ctx_bar(pct: u64) -> String {
+    let filled = (pct.min(100) * CTX_BAR_WIDTH).div_ceil(100);
+    let mut bar = String::new();
+    for i in 0..CTX_BAR_WIDTH {
+        bar.push(if i < filled { '█' } else { '░' });
+    }
+    bar
+}
+
+/// Context severity color: green while comfortable, yellow when filling, red near the limit.
+fn ctx_style(pct: u64) -> Style {
+    let color = match pct {
+        0..=59 => Color::Green,
+        60..=84 => Color::Yellow,
+        _ => Color::Red,
+    };
+    Style::default().fg(color)
+}
+
+/// Age color: fresh green, minutes yellow, stale red, ancient dimmed (long-idle ≠ urgent).
+fn age_style(secs: u64) -> Style {
+    let color = match secs {
+        0..=59 => Color::Green,
+        60..=599 => Color::Yellow,
+        600..=1_799 => Color::LightRed,
+        _ => Color::DarkGray,
+    };
+    Style::default().fg(color)
+}
+
 fn render_table(f: &mut Frame<'_>, area: Rect, app: &App) {
     let header = Row::new([
-        "STATUS", "TAB", "SESSION", "ACCT", "CTX%", "TOK", "AGE", "DIR", "PANE",
+        "STATUS", "TAB", "SESSION", "ACCT", "CTX", "TOK", "AGE", "DIR", "PANE",
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
     let selected = app.selected_index();
@@ -112,20 +146,28 @@ fn render_table(f: &mut Frame<'_>, area: Rect, app: &App) {
         } else {
             Style::default().fg(account_color(&account))
         };
-        let (ctx, tok) = r
-            .context_tokens
-            .map_or(("—".to_string(), "—".to_string()), |t| {
-                (format!("{}%", ctx_used_pct(t)), format_tokens(t))
-            });
-        let age = r.secs_since_append.map_or("—".to_string(), format_age);
+        let (ctx_cell, tok) = r.context_tokens.map_or_else(
+            || (Cell::from("—"), "—".to_string()),
+            |t| {
+                let pct = ctx_used_pct(t);
+                (
+                    Cell::from(ctx_bar(pct)).style(ctx_style(pct)),
+                    format_tokens(t),
+                )
+            },
+        );
+        let age_cell = r.secs_since_append.map_or_else(
+            || Cell::from("—"),
+            |secs| Cell::from(format_age(secs)).style(age_style(secs)),
+        );
         let row = Row::new([
             Cell::from(label).style(style),
             Cell::from(tab_cell(r)),
             Cell::from(r.name.clone()),
             Cell::from(account).style(account_style),
-            Cell::from(ctx),
+            ctx_cell,
             Cell::from(tok),
-            Cell::from(age),
+            age_cell,
             Cell::from(dir_name(&r.cwd).to_string()),
             Cell::from(pane_cell(r)),
         ]);
@@ -142,7 +184,7 @@ fn render_table(f: &mut Frame<'_>, area: Rect, app: &App) {
             Constraint::Length(3),
             Constraint::Min(24),
             Constraint::Length(6),
-            Constraint::Length(4),
+            Constraint::Length(10),
             Constraint::Length(5),
             Constraint::Length(4),
             Constraint::Max(16),
@@ -205,6 +247,7 @@ mod tests {
             context_tokens: tokens,
             secs_since_append: Some(75),
             pane: Some(crate::board::MatchedPane {
+                socket: String::new(),
                 tab_id: 3,
                 pane_id: 47,
                 tab_index: 2,
@@ -255,7 +298,11 @@ mod tests {
         assert!(screen.contains("⠿ working"));
         assert!(screen.contains("Pick an option"));
         assert!(screen.contains("golf-acct"));
-        assert!(screen.contains("60%"), "120k of 200k window");
+        assert!(
+            screen.contains("██████░░░░"),
+            "120k of 200k = 60% → 6 of 10 blocks, no percentage text"
+        );
+        assert!(!screen.contains('%'), "spec: visual gauge, no percentages");
         assert!(screen.contains("117k"));
         assert!(screen.contains("1m"), "75s age humanized");
         assert!(screen.contains("TAB"), "tab-bar position column");

@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+- **Multi-instance wezterm sensor** — root cause of the empty TAB/PANE board: two wezterm-gui
+  processes run (main + TUI monitor), and a `cli` call only answers from the instance owning
+  the invoking pane, so fleet on the monitor saw zero Claude panes. Fleet now discovers every
+  live instance (tasklist PIDs × gui-sock files; stale sockets HANG and are filtered) and
+  queries each via a WSLENV-forwarded `WEZTERM_UNIX_SOCKET` (`/w`). Jumps target the pane's
+  own instance.
+- Board visuals: CTX column is a colored 10-cell gauge (green/yellow/red, no percentage);
+  AGE is color-coded (fresh green, minutes yellow, stale red, ancient dimmed).
+
 - Board UX: Enter now switches the TAB too (`activate-tab` before `activate-pane` — pane
   activation alone doesn't bring the tab forward). New TAB column right after STATUS showing
   the tab-bar position number (tab emoticons aren't readable via the wezterm CLI — they're

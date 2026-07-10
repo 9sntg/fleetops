@@ -35,6 +35,8 @@ pub struct DoctorFacts {
     pub sessions: Vec<(String, bool, bool, bool)>,
     /// Sessions carrying exact WSLENV pane identity (spec 005).
     pub exact_panes: usize,
+    /// Live wezterm instances discovered (tasklist × socket files).
+    pub instances: usize,
     /// Ok(pane count) or the wezterm failure.
     pub wezterm: Result<usize, String>,
 }
@@ -47,6 +49,7 @@ impl Default for DoctorFacts {
             versions: BTreeSet::new(),
             sessions: Vec::new(),
             exact_panes: 0,
+            instances: 0,
             wezterm: Err("not checked".to_string()),
         }
     }
@@ -96,7 +99,11 @@ pub fn render_report(facts: &DoctorFacts) -> String {
     );
     match &facts.wezterm {
         Ok(count) => {
-            let _ = writeln!(out, "wezterm: reachable · {count} panes");
+            let _ = writeln!(
+                out,
+                "wezterm: {} instances · {count} Claude panes",
+                facts.instances
+            );
         }
         Err(e) => {
             let _ = writeln!(
@@ -123,7 +130,8 @@ pub fn render_report(facts: &DoctorFacts) -> String {
 /// Returns `(report, scan_ok)` — `scan_ok == false` means the scan itself failed (exit 1).
 pub async fn run(runner: &dyn Runner) -> (String, bool) {
     let claude_dir = paths::claude_dir();
-    let (wezterm, pane_list) = match panes::list_panes(runner).await {
+    let instances = panes::discover_sockets(runner).await.map_or(0, |s| s.len());
+    let (wezterm, pane_list) = match panes::list_all_panes(runner).await {
         Ok(rows) => (Ok(rows.len()), rows),
         Err(e) => (Err(e.to_string()), Vec::new()),
     };
@@ -137,6 +145,7 @@ pub async fn run(runner: &dyn Runner) -> (String, bool) {
         let projects = claude_dir.join("projects");
         let mut facts = DoctorFacts {
             scan,
+            instances,
             wezterm,
             ..DoctorFacts::default()
         };
@@ -199,13 +208,14 @@ mod tests {
             versions: ["2.1.206".to_string()].into(),
             sessions: vec![("fleetops".to_string(), true, true, true)],
             wezterm: Ok(23),
+            instances: 2,
             ..DoctorFacts::default()
         };
         let report = render_report(&facts);
         assert!(report.contains("36 total · 16 live · 20 stale-dead · 0 parse-failed"));
         assert!(report.contains("all known"));
         assert!(report.contains("2.1.206"));
-        assert!(report.contains("reachable · 23 panes"));
+        assert!(report.contains("2 instances · 23 Claude panes"));
         assert!(report.contains("✓ transcript · ✓ account · ✓ pane — fleetops"));
         assert!(!report.contains('⚠'));
     }
