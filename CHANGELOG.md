@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+- **macOS process source — the board works on macOS (spec 011, wave 11)** — session liveness no
+  longer needs Linux `/proc`, so the fleet is visible on a Mac. macOS Claude Code records
+  `procStart` as a UTC wall-clock string (`"Thu Jul 16 19:10:07 2026"`) rather than Linux clock
+  ticks, and `TZ=UTC ps -Ao pid=,tty=,lstart=` reproduces it byte-for-byte — so the PID-reuse
+  guard is unchanged (still a string equality, still opaque), only its source moved. `TZ=UTC` is
+  load-bearing: `procStart` is UTC and `ps` formats in local time, so without it every session
+  reads as PID-reused. Both sides are whitespace-normalized, so ps's space-padded day-of-month
+  ("Jul  6") can never decide liveness. The session's tty (`/dev/ttys000`) now comes from the same
+  single `ps` call that establishes liveness, replacing the `/proc/<pid>/fd/1` symlink read.
+  fleetops is **macOS-only** from this wave: the `/proc` source is deleted, not cfg-gated.
+
+- **Fixed: a broken process source no longer reads as an empty fleet** — on Linux a missing
+  `/proc` and a genuinely dead PID shared one silent code path, so the board rendered a clean,
+  empty, *wrong* fleet and `fleet doctor` still exited 0. A failed `ps` now sets
+  `ScanStats::procs_unavailable`, prints `⚠ process table unavailable: {e} — every session reads
+  as dead, this is NOT an empty fleet`, and exits non-zero.
+
 - **Fixed: wezterm socket dir is resolved at runtime, not a hardcoded username** — the
   release-prep scrub replaced the author's Windows username in the socket-dir constants with a
   placeholder (`user`), which pointed pane discovery at `/mnt/c/Users/user/.local/share/wezterm`

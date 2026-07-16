@@ -2,7 +2,7 @@
 //!
 //! Project: Fleetops — TUI monitoring all running Claude Code sessions (the fleet)
 //! Module:  src/doctor.rs
-//! Deps:    discovery, telemetry, board, panes, runner, paths
+//! Deps:    discovery, telemetry, board, panes, runner, paths, procsrc
 //! Tested:  inline `#[cfg(test)]` — report rendered pure from canned `DoctorFacts`
 //!
 //! Key responsibilities:
@@ -14,12 +14,11 @@
 //! - Rendering is pure over `DoctorFacts` so the report is testable with canned facts.
 
 use std::collections::BTreeSet;
-use std::path::Path;
 
 use crate::discovery::{self, NativeStatus, ScanStats};
 use crate::runner::Runner;
 use crate::telemetry::TailCache;
-use crate::{board, panes, paths};
+use crate::{board, panes, paths, procsrc};
 
 /// Everything the report renders — gathered once, rendered pure.
 #[derive(Debug)]
@@ -40,8 +39,9 @@ pub struct DoctorFacts {
     pub wezterm: Result<usize, String>,
     /// One instance answered, another failed — the pane list is partial.
     pub instance_error: Option<String>,
-    /// `/proc` is absent — fleetops targets WSL2/Linux; session discovery needs `/proc`.
-    pub proc_missing: bool,
+    /// The `ps` process table could not be fetched — liveness is unknowable, so every session
+    /// reads as dead. An empty board here is a broken sensor, not an empty fleet.
+    pub procs_error: Option<String>,
 }
 
 impl Default for DoctorFacts {
@@ -55,7 +55,7 @@ impl Default for DoctorFacts {
             instances: 0,
             wezterm: Err("not checked".to_string()),
             instance_error: None,
-            proc_missing: false,
+            procs_error: None,
         }
     }
 }
@@ -65,9 +65,10 @@ pub fn render_report(facts: &DoctorFacts) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     out.push_str("fleet doctor — read-only drift report\n\n");
-    if facts.proc_missing {
-        out.push_str(
-            "  ⚠ /proc not found — fleetops targets WSL2/Linux; the board is empty here\n",
+    if let Some(e) = &facts.procs_error {
+        let _ = writeln!(
+            out,
+            "  ⚠ process table unavailable: {e} — every session reads as dead, this is NOT an empty fleet"
         );
     }
     let _ = writeln!(
@@ -143,7 +144,8 @@ pub fn render_report(facts: &DoctorFacts) -> String {
 }
 
 /// Gather facts from the live system and render the report. Read-only.
-/// Returns `(report, scan_ok)` — `scan_ok == false` means the scan itself failed (exit 1).
+/// Returns `(report, scan_ok)` — `scan_ok == false` means the scan itself failed (exit 1):
+/// either the sessions dir was unreadable or the `ps` process table was unavailable.
 pub async fn run(runner: &dyn Runner) -> (String, bool) {
     let claude_dir = paths::claude_dir();
     let instances = panes::discover_sockets(runner).await.map_or(0, |s| s.len());
@@ -151,9 +153,16 @@ pub async fn run(runner: &dyn Runner) -> (String, bool) {
         Ok((rows, partial)) => (Ok(rows.len()), rows, partial),
         Err(e) => (Err(e.to_string()), Vec::new(), None),
     };
+    // Liveness comes from `ps`; a failure here means every session reads as dead, which must
+    // never be reported as a clean, empty fleet.
+    let (procs, procs_error) = match procsrc::fetch(runner).await {
+        Ok(table) => (table, None),
+        Err(e) => (crate::procsrc::ProcTable::new(), Some(e.to_string())),
+    };
 
     let facts = tokio::task::spawn_blocking(move || {
-        let (sessions, scan) = discovery::scan(&claude_dir.join("sessions"), Path::new("/proc"));
+        let (sessions, mut scan) = discovery::scan(&claude_dir.join("sessions"), &procs);
+        scan.procs_unavailable = procs_error.is_some();
         let mut cache = TailCache::default();
         let projects = claude_dir.join("projects");
         let mut facts = DoctorFacts {
@@ -161,7 +170,7 @@ pub async fn run(runner: &dyn Runner) -> (String, bool) {
             instances,
             wezterm,
             instance_error,
-            proc_missing: !Path::new("/proc").is_dir(),
+            procs_error,
             ..DoctorFacts::default()
         };
         for s in &sessions {
@@ -202,7 +211,9 @@ pub async fn run(runner: &dyn Runner) -> (String, bool) {
         return ("fleet doctor: scan task failed\n".to_string(), false);
     };
 
-    let scan_ok = !facts.scan.dir_unreadable;
+    // Both failures mean the numbers below are not a fleet reading: the dir couldn't be read, or
+    // liveness couldn't be established. Either way, exit non-zero rather than look clean.
+    let scan_ok = !facts.scan.dir_unreadable && !facts.scan.procs_unavailable;
     (render_report(&facts), scan_ok)
 }
 
@@ -246,7 +257,7 @@ mod tests {
                 parse_failed: 2,
                 stale_dead: 0,
                 live: 1,
-                dir_unreadable: false,
+                ..ScanStats::default()
             },
             unknown_statuses: ["pondering".to_string()].into(),
             sessions: vec![("mystery".to_string(), false, false, false)],
@@ -266,15 +277,22 @@ mod tests {
     }
 
     #[test]
-    fn missing_proc_prints_a_wsl2_platform_hint() {
+    fn unavailable_process_table_is_flagged_not_an_empty_fleet() {
+        // Replaces wave-10's `missing_proc_prints_a_wsl2_platform_hint`. On Linux a missing
+        // /proc and a dead PID shared one silent code path; the board read "nothing running".
+        // The macOS source must say the sensor broke.
         let facts = DoctorFacts {
-            proc_missing: true,
+            procs_error: Some("ps: exit 1".to_string()),
             ..DoctorFacts::default()
         };
         let report = render_report(&facts);
         assert!(
-            report.contains("/proc not found — fleetops targets WSL2/Linux"),
-            "missing /proc must surface a platform hint"
+            report.contains("process table unavailable: ps: exit 1"),
+            "a failed ps must name itself"
+        );
+        assert!(
+            report.contains("NOT an empty fleet"),
+            "and must not read as a clean, empty board"
         );
     }
 

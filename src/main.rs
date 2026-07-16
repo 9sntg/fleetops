@@ -23,6 +23,7 @@ mod fold;
 mod highlight;
 mod panes;
 mod paths;
+mod procsrc;
 mod runner;
 mod snapshot;
 mod telemetry;

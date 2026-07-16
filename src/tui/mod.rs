@@ -33,7 +33,7 @@ use crate::error::AppResult;
 use crate::panes::PaneCache;
 use crate::runner::{Exec, Runner};
 use crate::telemetry::TailCache;
-use crate::{board, collect, highlight, panes};
+use crate::{board, collect, highlight, panes, procsrc};
 
 use model::{App, Msg, Snapshot};
 
@@ -167,7 +167,9 @@ fn spawn_sweep(
 /// The row assembly itself is `collect::collect` — the SAME code `fleet snapshot` runs, so the
 /// board and the snapshot can never disagree (spec 009).
 async fn sweep(runner: &dyn Runner, cache: &Arc<Mutex<SweepCaches>>) -> Result<Snapshot, String> {
-    let panes_result = panes::list_all_panes(runner).await;
+    // Independent lanes — fetch concurrently.
+    let (panes_result, procs_result) =
+        tokio::join!(panes::list_all_panes(runner), procsrc::fetch(runner));
     let cache = Arc::clone(cache);
     tokio::task::spawn_blocking(move || {
         let mut guard = match cache.lock() {
@@ -177,7 +179,7 @@ async fn sweep(runner: &dyn Runner, cache: &Arc<Mutex<SweepCaches>>) -> Result<S
         // `collect` is the SAME pipeline `snapshot::run` uses, so the board and the snapshot
         // can never disagree (spec 009). The caches are held only for its duration, then dropped.
         let SweepCaches { tails, panes } = &mut *guard;
-        let collected = collect::collect(tails, panes, panes_result);
+        let collected = collect::collect(tails, panes, panes_result, procs_result);
         drop(guard); // release the caches before returning (lock-contention hygiene)
         Snapshot {
             seq: 0, // stamped by spawn_sweep

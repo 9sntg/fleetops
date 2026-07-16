@@ -1,26 +1,30 @@
-//! discovery ctx: live-session scan — sessions/*.json + /proc liveness + account attribution.
+//! discovery ctx: live-session scan — sessions/*.json filtered by the `ps` process table.
 //!
 //! Project: Fleetops — TUI monitoring all running Claude Code sessions (the fleet)
 //! Module:  src/discovery.rs
-//! Deps:    serde/serde_json; std::fs (called via spawn_blocking by the sensor)
+//! Deps:    serde/serde_json; procsrc (the process table); std::fs (called via spawn_blocking)
 //! Tested:  inline `#[cfg(test)]` — fixture tests/fixtures/session-file.json + tempdir scan
+//!          over a canned `ProcTable` (no process spawn, no fake /proc tree)
 //!
 //! Key responsibilities:
 //! - Parse `~/.claude/sessions/<pid>.json` tolerantly (undocumented internal, assumption A1).
-//! - Liveness invariant: session is live iff `/proc/<pid>` exists AND its starttime (stat
-//!   field 22) equals the file's `procStart` string (PID-reuse guard).
-//! - Attribute account from `/proc/<pid>/environ` `CLAUDE_ACCOUNT` (absent → unknown, not error).
-//! - Read the session's pts from `/proc/<pid>/fd/1` (wave 6, spec 006) — kept only when it
-//!   resolves under `/dev/pts/`, the highlight write-target guard.
+//! - Liveness invariant: session is live iff `ps` reports its pid AND that pid's start time
+//!   equals the file's `procStart` string (PID-reuse guard). macOS Claude Code writes
+//!   `procStart` as a UTC wall-clock string; `TZ=UTC ps -o lstart=` reproduces it (spec 011).
+//! - Carry the session's tty from the same table — the highlight write-target guard.
 //!
 //! Design constraints:
 //! - Read-only over the fleet; never writes into any Claude dir.
-//! - Stale files for dead PIDs are EXPECTED (20/36 at recon) — they are counted, never shown live.
-//! - Parsers stay pure over bytes; only `scan` touches the fs, with injectable roots for tests.
+//! - Stale files for dead PIDs are EXPECTED — they are counted, never shown live.
+//! - The `procStart` token is opaque and Claude-Code-authored: compared, never interpreted.
+//! - Parsers stay pure over bytes; `scan` touches only the sessions dir, and takes the process
+//!   table as plain data (fetched async by the caller) so it stays sync + spawn-free in tests.
 
 use std::path::Path;
 
 use serde::Deserialize;
+
+use crate::procsrc::{normalize_lstart, ProcFacts, ProcTable};
 
 /// Native coarse status from the session file. Unknown strings preserved (doctor drift signal).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +63,8 @@ pub struct SessionFile {
     pub session_id: String,
     /// Session working directory.
     pub cwd: String,
-    /// `/proc/<pid>/stat` starttime at launch, as a string (the liveness token).
+    /// The process start time Claude Code recorded at launch, as a string (the liveness token).
+    /// Opaque and never interpreted — only compared. macOS: UTC wall-clock, `ctime` style.
     pub proc_start: String,
     /// Derived session name (semantic title arrives via telemetry, wave 3).
     pub name: String,
@@ -96,12 +101,14 @@ pub struct LiveSession {
     /// Parsed session file.
     pub file: SessionFile,
     /// `CLAUDE_ACCOUNT` from the process environment, if readable.
+    /// Always `None` since wave 11 — it lived in `/proc/<pid>/environ`; the macOS equivalent
+    /// arrives in wave 12, folded into the one `ps -Eww` call the identity lane needs.
     pub account: Option<String>,
-    /// `WEZTERM_PANE` from the process environment — exact pane identity (wave 5, needs the
-    /// WSLENV forwarding; absent on sessions started before the wezterm restart).
+    /// `WEZTERM_PANE` from the process environment — exact pane identity.
+    /// Always `None` since wave 11; wave 12 replaces it with the cmux surface id.
     pub wezterm_pane: Option<u64>,
-    /// The session's own pts, from `read_link(<proc_root>/<pid>/fd/1)` — kept only when the
-    /// target starts with `/dev/pts/` (wave 6, spec 006). The highlight write target.
+    /// The session's controlling terminal (`/dev/ttys000`), from the process table.
+    /// The highlight write target.
     pub pts: Option<String>,
 }
 
@@ -119,6 +126,10 @@ pub struct ScanStats {
     /// The sessions dir itself could not be read — an empty fleet must not look identical
     /// to a failed scan (doctor exits 1 on this; the board footer surfaces it).
     pub dir_unreadable: bool,
+    /// The `ps` process table could not be fetched, so liveness is unknowable and EVERY session
+    /// reads as dead. Distinct from an empty fleet — the Linux-era `/proc` gap silently shared
+    /// one code path with a genuinely dead PID, and the board read as "nothing running".
+    pub procs_unavailable: bool,
 }
 
 /// Parse one session file. Unknown fields are skipped; missing optional fields defaulted.
@@ -136,8 +147,11 @@ pub fn parse_session_file(bytes: &[u8]) -> Option<SessionFile> {
     })
 }
 
-/// Extract starttime (field 22) from `/proc/<pid>/stat` content.
+/// Extract starttime (field 22) from Linux `/proc/<pid>/stat` content.
 /// comm (field 2) may contain spaces and parens — fields are counted after the LAST `)`.
+///
+/// Linux legacy: the Claude lane stopped using this in wave 11 (macOS has no `/proc`); it
+/// survives only because `codex.rs` still walks `/proc`. Wave 14 deletes both together.
 pub fn starttime_from_stat(stat: &str) -> Option<&str> {
     let after_comm = &stat[stat.rfind(')')? + 1..];
     // after_comm starts at field 3 (state); starttime is field 22 → index 19 here.
@@ -153,7 +167,13 @@ pub struct EnvironFacts {
     pub wezterm_pane: Option<u64>,
 }
 
-/// Extract the fields fleetops needs from environ bytes.
+/// Extract the fields fleetops needs from Linux `/proc/<pid>/environ` bytes.
+///
+/// Linux legacy: the Claude lane stopped using this in wave 11; it survives only because
+/// `codex.rs` still walks `/proc`. Wave 14 deletes both together.
+///
+/// The allowlist is load-bearing and must stay one: a session's environment carries secrets
+/// (under cmux, `CMUX_SOCKET_CAPABILITY`), and fleetops never captures or logs them.
 pub fn parse_environ(environ: &[u8]) -> EnvironFacts {
     let mut facts = EnvironFacts::default();
     for entry in environ
@@ -169,9 +189,9 @@ pub fn parse_environ(environ: &[u8]) -> EnvironFacts {
     facts
 }
 
-/// Scan `sessions_dir`, filter by liveness against `proc_root` (normally `/proc`), attribute
-/// accounts. Blocking fs work — the sensor calls this inside `spawn_blocking`.
-pub fn scan(sessions_dir: &Path, proc_root: &Path) -> (Vec<LiveSession>, ScanStats) {
+/// Scan `sessions_dir` and filter by liveness against the `ps` process table. Blocking fs work —
+/// the sensor calls this inside `spawn_blocking`, having fetched `procs` off the blocking task.
+pub fn scan(sessions_dir: &Path, procs: &ProcTable) -> (Vec<LiveSession>, ScanStats) {
     let mut stats = ScanStats::default();
     let mut live = Vec::new();
     let Ok(entries) = std::fs::read_dir(sessions_dir) else {
@@ -191,35 +211,29 @@ pub fn scan(sessions_dir: &Path, proc_root: &Path) -> (Vec<LiveSession>, ScanSta
             stats.parse_failed += 1;
             continue;
         };
-        if !is_live(proc_root, file.pid, &file.proc_start) {
+        let Some(facts) = live_facts(procs, file.pid, &file.proc_start) else {
             stats.stale_dead += 1;
             continue;
-        }
-        let environ = std::fs::read(proc_root.join(file.pid.to_string()).join("environ"))
-            .ok()
-            .map(|b| parse_environ(&b))
-            .unwrap_or_default();
-        let pts = std::fs::read_link(proc_root.join(file.pid.to_string()).join("fd").join("1"))
-            .ok()
-            .and_then(|target| target.to_str().map(str::to_string))
-            .filter(|target| target.starts_with("/dev/pts/"));
+        };
         live.push(LiveSession {
             file,
-            account: environ.account,
-            wezterm_pane: environ.wezterm_pane,
-            pts,
+            // account + pane identity land in wave 12 (one `ps -Eww` for both).
+            account: None,
+            wezterm_pane: None,
+            pts: facts.tty.clone(),
         });
     }
     stats.live = live.len();
     (live, stats)
 }
 
-/// The liveness invariant: `/proc/<pid>/stat` exists and its starttime matches `proc_start`.
-fn is_live(proc_root: &Path, pid: u32, proc_start: &str) -> bool {
-    let Ok(stat) = std::fs::read_to_string(proc_root.join(pid.to_string()).join("stat")) else {
-        return false;
-    };
-    starttime_from_stat(&stat) == Some(proc_start)
+/// The liveness invariant: `ps` reports `pid`, and that process's start time equals the session
+/// file's `proc_start`. Both sides are whitespace-normalized so ps's space-padded day-of-month
+/// can never decide liveness. A PID reused since the file was written has a different start
+/// time, so it fails here — that is the whole point of the check.
+fn live_facts<'t>(procs: &'t ProcTable, pid: u32, proc_start: &str) -> Option<&'t ProcFacts> {
+    let facts = procs.get(&pid)?;
+    (facts.lstart == normalize_lstart(proc_start)).then_some(facts)
 }
 
 #[cfg(test)]
@@ -233,8 +247,11 @@ mod tests {
         let f = parse_session_file(FIXTURE).expect("live fixture parses");
         assert_eq!(f.pid, 105_315);
         assert_eq!(f.session_id, "a01d7cea-b33a-4295-aa48-7a058966cdcb");
-        assert_eq!(f.cwd, "/home/user/project-a");
-        assert_eq!(f.proc_start, "126796");
+        assert_eq!(f.cwd, "/Users/user/project-a");
+        assert_eq!(
+            f.proc_start, "Thu Jul 16 19:10:07 2026",
+            "macOS records procStart as a UTC wall-clock string, not Linux clock ticks"
+        );
         assert_eq!(f.name, "project-a-fe");
         assert_eq!(f.status, NativeStatus::Shell);
     }
@@ -288,18 +305,15 @@ mod tests {
         assert_eq!(weird.account.as_deref(), Some("bravo"));
     }
 
-    /// Build a fake proc root: `<root>/<pid>/stat` (+ optional environ).
-    fn fake_proc(root: &Path, pid: u32, starttime: &str, account: Option<&str>) {
-        let dir = root.join(pid.to_string());
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("stat"),
-            format!("{pid} (claude) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 {starttime} 23"),
-        )
-        .unwrap();
-        if let Some(a) = account {
-            std::fs::write(dir.join("environ"), format!("CLAUDE_ACCOUNT={a}\0")).unwrap();
-        }
+    /// Build a canned process table row — the `ps` output the sensor would have fetched.
+    fn proc_row(table: &mut ProcTable, pid: u32, lstart: &str, tty: Option<&str>) {
+        table.insert(
+            pid,
+            ProcFacts {
+                lstart: normalize_lstart(lstart),
+                tty: tty.map(str::to_string),
+            },
+        );
     }
 
     fn session_json(pid: u32, proc_start: &str, status: &str) -> String {
@@ -312,89 +326,125 @@ mod tests {
     fn scan_keeps_live_drops_dead_and_reused_counts_parse_failures() {
         let tmp = std::env::temp_dir().join(format!("fleet-test-{}", std::process::id()));
         let sessions = tmp.join("sessions");
-        let proc_root = tmp.join("proc");
         std::fs::create_dir_all(&sessions).unwrap();
-        std::fs::create_dir_all(&proc_root).unwrap();
 
-        std::fs::write(sessions.join("1.json"), session_json(1, "100", "busy")).unwrap();
-        fake_proc(&proc_root, 1, "100", Some("alpha")); // live
-        std::fs::write(sessions.join("2.json"), session_json(2, "200", "idle")).unwrap();
-        fake_proc(&proc_root, 2, "999", None); // PID reused (starttime differs)
-        std::fs::write(sessions.join("3.json"), session_json(3, "300", "busy")).unwrap();
-        // pid 3: no proc entry — dead
+        let live_start = "Thu Jul 16 19:10:07 2026";
+        let mut procs = ProcTable::new();
+        std::fs::write(sessions.join("1.json"), session_json(1, live_start, "busy")).unwrap();
+        proc_row(&mut procs, 1, live_start, Some("/dev/ttys000")); // live
+        std::fs::write(sessions.join("2.json"), session_json(2, live_start, "idle")).unwrap();
+        proc_row(&mut procs, 2, "Thu Jul 16 21:00:00 2026", None); // PID reused: start differs
+        std::fs::write(sessions.join("3.json"), session_json(3, live_start, "busy")).unwrap();
+        // pid 3: absent from the table — dead
         std::fs::write(sessions.join("4.json"), "garbage").unwrap();
         std::fs::write(sessions.join("README.md"), "not a session").unwrap();
 
-        let (live, stats) = scan(&sessions, &proc_root);
+        let (live, stats) = scan(&sessions, &procs);
         std::fs::remove_dir_all(&tmp).ok();
 
         assert_eq!(stats.total_files, 4);
         assert_eq!(stats.parse_failed, 1);
-        assert_eq!(stats.stale_dead, 2);
+        assert_eq!(stats.stale_dead, 2, "one reused PID + one dead PID");
         assert_eq!(stats.live, 1);
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].file.pid, 1);
-        assert_eq!(live[0].account.as_deref(), Some("alpha"));
+        assert_eq!(live[0].pts.as_deref(), Some("/dev/ttys000"));
     }
 
     #[test]
-    fn live_session_without_environ_is_live_with_unknown_account() {
-        let tmp = std::env::temp_dir().join(format!("fleet-env-{}", std::process::id()));
+    fn pid_reuse_is_caught_by_the_start_time_not_the_pid() {
+        // THE guard: the pid is alive, but it is a DIFFERENT process than the one that wrote
+        // the session file. Dropping this check would "fix" the board by showing lies.
+        let tmp = std::env::temp_dir().join(format!("fleet-reuse-{}", std::process::id()));
         let sessions = tmp.join("sessions");
-        let proc_root = tmp.join("proc");
         std::fs::create_dir_all(&sessions).unwrap();
-        std::fs::create_dir_all(&proc_root).unwrap();
-        std::fs::write(sessions.join("5.json"), session_json(5, "500", "busy")).unwrap();
-        fake_proc(&proc_root, 5, "500", None); // stat readable, environ absent
+        std::fs::write(
+            sessions.join("7.json"),
+            session_json(7, "Thu Jul 16 19:10:07 2026", "busy"),
+        )
+        .unwrap();
+        let mut procs = ProcTable::new();
+        proc_row(&mut procs, 7, "Thu Jul 16 19:10:08 2026", None); // one second later
 
-        let (live, stats) = scan(&sessions, &proc_root);
+        let (live, stats) = scan(&sessions, &procs);
         std::fs::remove_dir_all(&tmp).ok();
 
-        assert_eq!(
-            stats.live, 1,
-            "unreadable environ never drops a live session"
+        assert!(
+            live.is_empty(),
+            "a one-second start-time drift is PID reuse"
         );
-        assert_eq!(live[0].account, None, "absent → unknown, not error");
-        assert_eq!(live[0].wezterm_pane, None);
+        assert_eq!(stats.stale_dead, 1);
+    }
+
+    #[test]
+    fn liveness_survives_a_space_padded_day_of_month() {
+        // ps pads a single-digit day ("Jul  6"); Claude Code's padding is unverified. Both sides
+        // normalize, so padding must never decide liveness (spec 011 ponytail).
+        let tmp = std::env::temp_dir().join(format!("fleet-pad-{}", std::process::id()));
+        let sessions = tmp.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("9.json"),
+            session_json(9, "Mon Jul 6 19:10:07 2026", "busy"),
+        )
+        .unwrap();
+        let mut procs = ProcTable::new();
+        proc_row(&mut procs, 9, "Mon Jul  6 19:10:07 2026", None); // ps's padded form
+
+        let (live, stats) = scan(&sessions, &procs);
+        std::fs::remove_dir_all(&tmp).ok();
+
+        assert_eq!(stats.live, 1, "padding is not a start-time difference");
+        assert_eq!(live.len(), 1);
+    }
+
+    #[test]
+    fn session_without_a_tty_is_still_live() {
+        let tmp = std::env::temp_dir().join(format!("fleet-env-{}", std::process::id()));
+        let sessions = tmp.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let start = "Thu Jul 16 19:10:07 2026";
+        std::fs::write(sessions.join("5.json"), session_json(5, start, "busy")).unwrap();
+        let mut procs = ProcTable::new();
+        proc_row(&mut procs, 5, start, None); // ps reported `??`
+
+        let (live, stats) = scan(&sessions, &procs);
+        std::fs::remove_dir_all(&tmp).ok();
+
+        assert_eq!(stats.live, 1, "no tty never drops a live session");
+        assert_eq!(live[0].pts, None, "absent → unknown, not error");
+        assert_eq!(live[0].account, None, "account lands in wave 12");
     }
 
     #[test]
     fn scan_of_missing_dir_is_flagged_not_a_silent_empty_fleet() {
-        let (live, stats) = scan(Path::new("/nonexistent-fleet-dir"), Path::new("/proc"));
+        let (live, stats) = scan(Path::new("/nonexistent-fleet-dir"), &ProcTable::new());
         assert!(live.is_empty());
         assert!(stats.dir_unreadable);
         assert_eq!(stats.total_files, 0);
     }
 
     #[test]
-    fn scan_reads_pts_from_fd_1_symlink_dev_pts_only() {
-        let tmp = std::env::temp_dir().join(format!("fleet-pts-{}", std::process::id()));
+    fn an_empty_process_table_drops_everything() {
+        // Why `procs_unavailable` has to exist: a failed `ps` is indistinguishable HERE from a
+        // machine with nothing running. The caller must flag it; scan alone cannot tell.
+        let tmp = std::env::temp_dir().join(format!("fleet-noprocs-{}", std::process::id()));
         let sessions = tmp.join("sessions");
-        let proc_root = tmp.join("proc");
         std::fs::create_dir_all(&sessions).unwrap();
-        std::fs::create_dir_all(&proc_root).unwrap();
+        std::fs::write(
+            sessions.join("1.json"),
+            session_json(1, "Thu Jul 16 19:10:07 2026", "busy"),
+        )
+        .unwrap();
 
-        std::fs::write(sessions.join("1.json"), session_json(1, "100", "busy")).unwrap();
-        fake_proc(&proc_root, 1, "100", None);
-        let fd1 = proc_root.join("1").join("fd");
-        std::fs::create_dir_all(&fd1).unwrap();
-        std::os::unix::fs::symlink("/dev/pts/7", fd1.join("1")).unwrap();
-
-        std::fs::write(sessions.join("2.json"), session_json(2, "200", "busy")).unwrap();
-        fake_proc(&proc_root, 2, "200", None);
-        let fd2 = proc_root.join("2").join("fd");
-        std::fs::create_dir_all(&fd2).unwrap();
-        std::os::unix::fs::symlink("/dev/null", fd2.join("1")).unwrap();
-
-        let (live, _stats) = scan(&sessions, &proc_root);
+        let (live, stats) = scan(&sessions, &ProcTable::new());
         std::fs::remove_dir_all(&tmp).ok();
 
-        let pts_of = |pid: u32| live.iter().find(|s| s.file.pid == pid).unwrap().pts.clone();
-        assert_eq!(
-            pts_of(1),
-            Some("/dev/pts/7".to_string()),
-            "fd/1 -> a real pts is kept"
+        assert!(live.is_empty());
+        assert_eq!(stats.stale_dead, 1);
+        assert!(
+            !stats.procs_unavailable,
+            "scan cannot know why the table is empty — the fetcher sets this"
         );
-        assert_eq!(pts_of(2), None, "fd/1 -> /dev/null is filtered out");
     }
 }

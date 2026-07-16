@@ -2,7 +2,7 @@
 //!
 //! Project: Fleetops — TUI monitoring all running Claude Code sessions (the fleet)
 //! Module:  src/collect.rs
-//! Deps:    discovery, telemetry, board, codex, panes, paths (all fetched/pure seams)
+//! Deps:    discovery, telemetry, board, codex, panes, paths, procsrc (all fetched/pure seams)
 //! Tested:  n/a directly — its steps are table-tested in their own modules; this is the shared
 //!          orchestration so `tui::sweep` and `snapshot::run` can never diverge (spec 009).
 //!
@@ -14,6 +14,8 @@
 //! Design constraints:
 //! - Blocking fs work (`discovery::scan`, tail reads, `codex::scan`) — call inside
 //!   `spawn_blocking`, never on the UI task.
+//! - The process table and the pane list are both fetched ASYNC by the caller and handed in as
+//!   plain results, so this stays sync and spawn-free (spec 011).
 //! - The caches are borrowed for the whole call; the TUI passes its persistent ones (held under
 //!   the sweep mutex), the snapshot passes fresh ones. Read-only over the fleet.
 
@@ -23,6 +25,7 @@ use crate::board::{self, SessionRow};
 use crate::discovery::{self, ScanStats};
 use crate::error::AppResult;
 use crate::panes::{PaneCache, PaneRow};
+use crate::procsrc::ProcTable;
 use crate::telemetry::{TailCache, Telemetry};
 use crate::{codex, paths};
 
@@ -39,15 +42,23 @@ pub struct Collected {
     pub codex_count: usize,
 }
 
-/// Scan + fold the whole fleet into sorted rows, reusing the given caches. `panes_result` is the
-/// already-fetched `panes::list_all_panes` output (fetched off the blocking task).
+/// Scan + fold the whole fleet into sorted rows, reusing the given caches. `panes_result` and
+/// `procs_result` are already fetched by the caller (both off the blocking task).
 pub fn collect(
     tails: &mut TailCache,
     pane_cache: &mut PaneCache,
     panes_result: AppResult<(Vec<PaneRow>, Option<String>)>,
+    procs_result: AppResult<ProcTable>,
 ) -> Collected {
     let claude_dir = paths::claude_dir();
-    let (sessions, stats) = discovery::scan(&claude_dir.join("sessions"), Path::new("/proc"));
+    // A failed `ps` is NOT an empty fleet: liveness is unknowable, so every session would read
+    // as dead. Flag it loudly rather than render a clean, empty, wrong board.
+    let (procs, proc_error) = match procs_result {
+        Ok(table) => (table, None),
+        Err(e) => (ProcTable::new(), Some(format!("process table: {e}"))),
+    };
+    let (sessions, mut stats) = discovery::scan(&claude_dir.join("sessions"), &procs);
+    stats.procs_unavailable = proc_error.is_some();
     let projects = claude_dir.join("projects");
     let telemetry: Vec<Telemetry> = sessions
         .iter()
@@ -58,7 +69,10 @@ pub fn collect(
         .map(|s| s.file.session_id.as_str())
         .collect();
     tails.retain(&live_ids);
-    let (pane_rows, lane_error) = pane_cache.fold(panes_result);
+    let (pane_rows, pane_error) = pane_cache.fold(panes_result);
+    // A dead process table empties the board; a degraded pane lane only costs the PANE column.
+    // Surface the more severe one.
+    let lane_error = proc_error.or(pane_error);
     let mut rows = board::assemble(&sessions, &telemetry, &pane_rows);
     let codex_rows = codex::scan(&paths::codex_dir(), Path::new("/proc"), &pane_rows);
     let codex_count = codex_rows.len();

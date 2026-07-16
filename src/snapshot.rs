@@ -77,16 +77,17 @@ fn render_json(focused_pane_id: Option<u64>, rows: &[SessionRow]) -> String {
 /// Gather the snapshot and render it. Returns `(json, scan_ok)` — `scan_ok == false` (sessions
 /// dir unreadable or the scan task crashed) means exit non-zero, exactly like `fleet doctor`.
 pub async fn run(runner: &dyn Runner) -> (String, bool) {
-    // Focused pane and the pane list are independent — fetch concurrently.
-    let (focused, panes_result) = tokio::join!(
+    // Focused pane, the pane list and the process table are independent — fetch concurrently.
+    let (focused, panes_result, procs_result) = tokio::join!(
         panes::focused_pane_id(runner),
-        panes::list_all_panes(runner)
+        panes::list_all_panes(runner),
+        crate::procsrc::fetch(runner)
     );
     let collected = tokio::task::spawn_blocking(move || {
         // Fresh caches: a one-shot has nothing to reuse across sweeps.
         let mut tails = crate::telemetry::TailCache::default();
         let mut pane_cache = crate::panes::PaneCache::default();
-        collect::collect(&mut tails, &mut pane_cache, panes_result)
+        collect::collect(&mut tails, &mut pane_cache, panes_result, procs_result)
     })
     .await;
     match collected {
