@@ -44,6 +44,7 @@ use crate::board::{self, SessionRow};
 use crate::cmux::Surface;
 use crate::error::AppResult;
 use crate::fold::{self, Status};
+use crate::git;
 use crate::procsrc::ProcTable;
 use crate::runner::{CommandSpec, Runner};
 
@@ -514,6 +515,8 @@ fn build_row(
     surfaces: &[Surface],
 ) -> SessionRow {
     let pane = board::match_surface(proc.surface_id.as_deref(), surfaces);
+    // This lane already touches the fs (rollout walk), so it resolves its own branch.
+    let branch = git::branch_of(Path::new(&proc.cwd));
     // The highlight write-target guard, same as the Claude lane (wave 6, spec 006): a process is
     // only ever highlightable when it renders in a wezterm pane.
     let pts = if proc.surface_id.is_some() {
@@ -537,6 +540,8 @@ fn build_row(
             context_tokens: None,
             ctx_pct: None,
             secs_since_append: None,
+            stream: pane.as_ref().map(|p| p.stream.clone()),
+            branch,
             pane,
             pts,
         };
@@ -561,6 +566,8 @@ fn build_row(
         context_tokens: facts.tokens,
         ctx_pct: facts.ctx_pct,
         secs_since_append: age_secs,
+        stream: pane.as_ref().map(|p| p.stream.clone()),
+        branch,
         pane,
         pts,
     }
@@ -953,6 +960,7 @@ mod tests {
             id: "uuid-codex".to_string(),
             window_index: 1,
             tab_index: 3,
+            name: "codex-stream".to_string(),
             cwd: String::new(),
         }];
         let rows = scan(&codex_root, &[proc], &surfaces);
@@ -965,6 +973,11 @@ mod tests {
             row.pane.as_ref().map(|p| p.tab_index),
             Some(3),
             "a Codex session under cmux matches its surface by exact id, same as Claude"
+        );
+        assert_eq!(
+            row.stream.as_deref(),
+            Some("codex-stream"),
+            "spec 015: STREAM applies to Codex rows too"
         );
         assert_eq!(
             row.pts.as_deref(),

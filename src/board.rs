@@ -45,6 +45,10 @@ pub struct SessionRow {
     pub secs_since_append: Option<u64>,
     /// Matched cmux surface — the jump target.
     pub pane: Option<MatchedPane>,
+    /// The cmux workstream (workspace/tab name) this session runs in — `None` outside cmux.
+    pub stream: Option<String>,
+    /// The git branch of the session's cwd — `None` when it isn't in a repo (spec 015).
+    pub branch: Option<String>,
     /// The session's pts, carried through only when it renders in a cmux surface — the
     /// highlight write-target guard lives here, not in the writer (wave 6, spec 006).
     pub pts: Option<String>,
@@ -60,6 +64,8 @@ pub struct MatchedPane {
     /// 1-based tab (workspace) position within its window; emitted by `fleet snapshot` for
     /// automation and rendered in the board's PANE column.
     pub tab_index: u32,
+    /// The workspace (tab) name — the STREAM column (spec 015).
+    pub stream: String,
 }
 
 impl MatchedPane {
@@ -68,6 +74,7 @@ impl MatchedPane {
             surface_id: s.id.clone(),
             window_index: s.window_index,
             tab_index: s.tab_index,
+            stream: s.name.clone(),
         }
     }
 }
@@ -86,17 +93,22 @@ pub fn match_surface(surface_id: Option<&str>, surfaces: &[Surface]) -> Option<M
         .map(MatchedPane::from_surface)
 }
 
-/// Join sessions with their telemetry (parallel slice, same order) and the cmux surface list.
-/// Output is sorted: attention buckets first, then by name.
+/// Join sessions with their telemetry and branches (parallel slices, same order) and the cmux
+/// surface list. Output is sorted: attention buckets first, then by name.
+///
+/// `branches` is resolved by the caller, not here: reading `.git` is I/O and this stays pure
+/// (spec 015) — same contract as `telemetry`.
 pub fn assemble(
     sessions: &[LiveSession],
     telemetry: &[Telemetry],
+    branches: &[Option<String>],
     surfaces: &[Surface],
 ) -> Vec<SessionRow> {
     let mut rows: Vec<SessionRow> = sessions
         .iter()
         .zip(telemetry)
-        .map(|(session, tel)| {
+        .zip(branches)
+        .map(|((session, tel), branch)| {
             let facts = tel.facts.clone().unwrap_or_default();
             let status = fold::status(
                 &session.file.status,
@@ -119,6 +131,8 @@ pub fn assemble(
                     .context_tokens
                     .map(|t| clamp_pct_u8(telemetry::ctx_used_pct(t))),
                 secs_since_append: tel.secs_since_append,
+                stream: pane.as_ref().map(|p| p.stream.clone()),
+                branch: branch.clone(),
                 pane,
                 // The highlight write-target guard: a session is only ever highlightable when
                 // it renders in a cmux surface (spec 006, retargeted in spec 012).
@@ -176,6 +190,7 @@ mod tests {
             id: id.to_string(),
             window_index: 1,
             tab_index,
+            name: format!("stream-{tab_index}"),
             cwd: cwd.to_string(),
         }
     }
@@ -185,6 +200,7 @@ mod tests {
             surface_id: id.to_string(),
             window_index: 1,
             tab_index,
+            stream: format!("stream-{tab_index}"),
         }
     }
 
@@ -271,8 +287,19 @@ mod tests {
             }),
             Some(1),
         )];
-        let rows = assemble(&sessions, &tel, &[surface("uuid-3", 3, "/z")]);
+        let branches = [Some("main".to_string())];
+        let rows = assemble(&sessions, &tel, &branches, &[surface("uuid-3", 3, "/z")]);
         assert_eq!(rows[0].name, "native");
+        assert_eq!(
+            rows[0].stream.as_deref(),
+            Some("stream-3"),
+            "spec 015: from the surface"
+        );
+        assert_eq!(
+            rows[0].branch.as_deref(),
+            Some("main"),
+            "spec 015: from the caller"
+        );
         assert_eq!(
             rows[0].pane,
             Some(matched("uuid-3", 3)),
@@ -313,11 +340,18 @@ mod tests {
             ),
             telemetry(Some(TailFacts::default()), Some(10)),
         ];
-        let rows = assemble(&sessions, &tel, &[surface("uuid-7", 7, "/b")]);
+        let branches = [None, Some("feat/x".to_string()), None];
+        let rows = assemble(&sessions, &tel, &branches, &[surface("uuid-7", 7, "/b")]);
         assert_eq!(rows[0].session_id, "s-ask", "NeedsAnswer sorts first");
         assert_eq!(rows[0].status, Status::NeedsAnswer);
         assert_eq!(rows[0].name, "Pick an option", "ai-title wins");
         assert_eq!(rows[0].pane, Some(matched("uuid-7", 7)));
+        assert_eq!(rows[0].stream.as_deref(), Some("stream-7"));
+        assert_eq!(
+            rows[0].branch.as_deref(),
+            Some("feat/x"),
+            "branches ride the parallel slice, so sorting must not desync them from their row"
+        );
         assert_eq!(rows[0].context_tokens, Some(120_000));
         assert_eq!(rows[1].status, Status::Working);
         assert_eq!(rows[2].status, Status::Idle);
@@ -326,7 +360,7 @@ mod tests {
     #[test]
     fn assemble_without_transcript_uses_native_name_and_no_tokens() {
         let sessions = [session("s1", "/a", "native", NativeStatus::Busy)];
-        let rows = assemble(&sessions, &[Telemetry::default()], &[]);
+        let rows = assemble(&sessions, &[Telemetry::default()], &[None], &[]);
         assert_eq!(rows[0].name, "native");
         assert_eq!(rows[0].context_tokens, None);
         assert_eq!(
@@ -364,7 +398,7 @@ mod tests {
             ..session("s2", "/b", "two", NativeStatus::Busy)
         };
         let tel = [Telemetry::default(), Telemetry::default()];
-        let rows = assemble(&[in_cmux, outside_cmux], &tel, &[]);
+        let rows = assemble(&[in_cmux, outside_cmux], &tel, &[None, None], &[]);
         let pts_of = |id: &str| {
             rows.iter()
                 .find(|r| r.session_id == id)
@@ -394,6 +428,8 @@ mod tests {
             context_tokens: None,
             ctx_pct: None,
             secs_since_append: None,
+            stream: None,
+            branch: None,
             pane: None,
             pts: None,
         }

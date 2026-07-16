@@ -323,10 +323,13 @@ mod tests {
             context_tokens: Some(50_000),
             ctx_pct: None,
             secs_since_append: Some(3),
+            stream: Some("gtm-studio".to_string()),
+            branch: Some("main".to_string()),
             pane: surface.map(|id| MatchedPane {
                 surface_id: id.to_string(),
                 window_index: 1,
                 tab_index: 1,
+                stream: "a-stream".to_string(),
             }),
             pts: pts.map(str::to_string),
         }

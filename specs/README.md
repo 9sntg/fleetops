@@ -18,3 +18,4 @@ Waves are defined by the architecture dossier in `plans/001-*`.
 | 11 | [011-wave11-macos-process-source](011-wave11-macos-process-source.md) | 🚧 Draft |
 | 12/13 | [012-wave12-cmux-lane](012-wave12-cmux-lane.md) | 🚧 Draft |
 | 14 | [014-wave14-codex-macos](014-wave14-codex-macos.md) | 🚧 Draft |
+| 15 | [015-wave15-stream-branch](015-wave15-stream-branch.md) | 🚧 Draft |

@@ -2,7 +2,7 @@
 //!
 //! Project: Fleetops — TUI monitoring all running Claude Code sessions (the fleet)
 //! Module:  src/collect.rs
-//! Deps:    discovery, telemetry, board, codex, panes, paths, procsrc (all fetched/pure seams)
+//! Deps:    discovery, telemetry, board, codex, cmux, paths, procsrc, git (fetched/pure seams)
 //! Tested:  n/a directly — its steps are table-tested in their own modules; this is the shared
 //!          orchestration so `tui::sweep` and `snapshot::run` can never diverge (spec 009).
 //!
@@ -19,11 +19,14 @@
 //! - The caches are borrowed for the whole call; the TUI passes its persistent ones (held under
 //!   the sweep mutex), the snapshot passes fresh ones. Read-only over the fleet.
 
+use std::path::Path;
+
 use crate::board::{self, SessionRow};
 use crate::cmux::{Surface, SurfaceCache};
 use crate::codex::ProcInfo;
 use crate::discovery::{self, ScanStats};
 use crate::error::AppResult;
+use crate::git;
 use crate::procsrc::ProcTable;
 use crate::telemetry::{TailCache, Telemetry};
 use crate::{codex, paths};
@@ -64,6 +67,12 @@ pub fn collect(
         .iter()
         .map(|s| tails.read(&projects, &s.file.cwd, &s.file.session_id))
         .collect();
+    // Branches are I/O, so they're resolved here (this is already the blocking task) and handed
+    // to `board::assemble` as a parallel slice — assembly stays pure (spec 015).
+    let branches: Vec<Option<String>> = sessions
+        .iter()
+        .map(|s| git::branch_of(Path::new(&s.file.cwd)))
+        .collect();
     let live_ids: Vec<&str> = sessions
         .iter()
         .map(|s| s.file.session_id.as_str())
@@ -73,7 +82,7 @@ pub fn collect(
     // A dead process table empties the board; a degraded cmux lane only costs the PANE column.
     // Surface the more severe one.
     let lane_error = proc_error.or(surface_error);
-    let mut rows = board::assemble(&sessions, &telemetry, &surfaces);
+    let mut rows = board::assemble(&sessions, &telemetry, &branches, &surfaces);
     let codex_rows = codex::scan(&paths::codex_dir(), codex_procs, &surfaces);
     let codex_count = codex_rows.len();
     rows.extend(codex_rows);

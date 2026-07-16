@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+- **STREAM + BRANCH columns (spec 015, wave 15)** — two new columns between DIR and SESSION.
+  - **STREAM** is the cmux workspace name (cmux's own term for a unit of work is "workstream").
+    It rides in on the existing AppleScript call and comes from the *surface match*, not the cwd —
+    which is load-bearing: two workspaces can share one cwd (live: `skills` and `rules` both on
+    `~/Desktop`), so only the exact surface id distinguishes them. A workspace cmux auto-named
+    after its agent carries the agent's status glyph; that's stripped, since STATUS already shows it.
+  - **BRANCH** reads `.git` directly — never a `git` subprocess, which would be one spawn per
+    session per 2 s sweep. Handles all three real shapes: a plain repo, a cwd below the root
+    (walks up), and a **worktree**, where `.git` is a FILE pointing at `worktrees/<n>/HEAD` —
+    the common case here (4 of 9 live sessions), not an edge case. Detached HEAD → short sha;
+    no repo → `—`. Both columns apply to Codex rows too.
+  - Over-long values are ellipsised, not silently clipped: a clipped `feat/email-signal-` reads
+    as a real branch name and isn't one.
+  - `board::assemble` stays pure — branches are resolved in `collect` (already the blocking task)
+    and passed as a parallel slice, same contract as `telemetry`.
+  - **The board's minimum width grows from 93 to 129 columns.** Below that ratatui squeezes ACCT
+    first; the view tests now assert at the designed width.
+
 - **The Codex lane works on macOS (spec 014, wave 14)** — it walked `/proc`, so it returned empty
   here. Now `ps` + `lsof`, and **`/proc` no longer appears anywhere in `src/`**.
   - **The Linux recognizer could not be reused, and the difference is invisible.** Linux gated on

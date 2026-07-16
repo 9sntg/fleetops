@@ -39,11 +39,13 @@ pub struct Surface {
     pub window_index: u32,
     /// 1-based tab (workspace) position within its window.
     pub tab_index: u32,
+    /// The workspace (tab) name — cmux's "workstream", glyph-stripped (spec 015).
+    pub name: String,
     /// The terminal's working directory.
     pub cwd: String,
 }
 
-/// Emit one tab-separated row per terminal: `id \t window# \t tab# \t cwd`.
+/// Emit one tab-separated row per terminal: `id \t window# \t tab# \t tabName \t cwd`.
 /// `d` is bound outside the `tell` block — see the module header on the `tab` class shadowing.
 const LIST_SCRIPT: &str = r#"set d to character id 9
 set out to ""
@@ -55,7 +57,7 @@ tell application "cmux"
     repeat with t in tabs of w
       set ti to ti + 1
       repeat with tm in terminals of t
-        set out to out & (id of tm) & d & wi & d & ti & d & (working directory of tm) & linefeed
+        set out to out & (id of tm) & d & wi & d & ti & d & (name of t) & d & (working directory of tm) & linefeed
       end repeat
     end repeat
   end repeat
@@ -137,6 +139,7 @@ fn parse_row(line: &str) -> Option<Surface> {
     let id = fields.next()?.trim();
     let window_index = fields.next()?.trim().parse().ok()?;
     let tab_index = fields.next()?.trim().parse().ok()?;
+    let name = fields.next().unwrap_or_default();
     let cwd = fields.next().unwrap_or_default().trim();
     if id.is_empty() {
         return None;
@@ -145,8 +148,26 @@ fn parse_row(line: &str) -> Option<Surface> {
         id: id.to_string(),
         window_index,
         tab_index,
+        name: strip_status_glyph(name),
         cwd: cwd.to_string(),
     })
+}
+
+/// Drop a leading agent status glyph from a workspace name.
+///
+/// cmux auto-names a workspace after its agent's title until the user renames it, and that
+/// auto-name carries the agent's status glyph (observed live: `✳ Check current global skills`,
+/// `⠐ Review project rules and guidelines`). The glyph is status — which the STATUS column
+/// already renders — so the STREAM column shows the name only (spec 015).
+pub fn strip_status_glyph(name: &str) -> String {
+    let mut chars = name.chars();
+    let stripped = match chars.next() {
+        // Braille spinner frames (working) and ✳ (idle) — the same convention wave 12 retired
+        // `classify_title` for.
+        Some('\u{2800}'..='\u{28FF}' | '✳') => chars.as_str(),
+        _ => name,
+    };
+    stripped.trim().to_string()
 }
 
 /// Fetch the cmux topology. An error here means the jump lane is down (cmux not running, or
@@ -199,12 +220,55 @@ mod tests {
     #[test]
     fn fixture_parses_to_surfaces() {
         let surfaces = parse_list(FIXTURE);
-        assert_eq!(surfaces.len(), 4, "live fixture: one window, four tabs");
+        assert_eq!(surfaces.len(), 7, "live fixture: one window, seven tabs");
         assert_eq!(surfaces[0].id, "277E65DB-005E-4B3A-B4D3-A290839E4F3C");
         assert_eq!(surfaces[0].window_index, 1);
         assert_eq!(surfaces[0].tab_index, 1);
+        assert_eq!(surfaces[0].name, "gtm-studio");
         assert_eq!(surfaces[0].cwd, "/Users/user/Desktop/groupon-gtm-studio");
         assert_eq!(surfaces[3].tab_index, 4);
+    }
+
+    #[test]
+    fn fixture_carries_the_workstream_names() {
+        let surfaces = parse_list(FIXTURE);
+        let names: Vec<&str> = surfaces.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"gtm-studio"));
+        assert!(names.contains(&"email-signal-capture"));
+        // Two tabs share one cwd with different names — proof STREAM is not derivable from cwd,
+        // and must come from the surface match (spec 015).
+        let desktop = names
+            .iter()
+            .filter(|n| **n == "skills" || **n == "rules")
+            .count();
+        assert_eq!(desktop, 2);
+        let same_cwd = surfaces
+            .iter()
+            .filter(|s| s.cwd == "/Users/user/Desktop")
+            .count();
+        assert_eq!(same_cwd, 2, "two workstreams, one cwd");
+    }
+
+    #[test]
+    fn strip_status_glyph_table() {
+        // cmux auto-names a workspace after its agent's title, glyph and all, until renamed.
+        // Observed live 2026-07-16.
+        assert_eq!(
+            strip_status_glyph("✳ Check current global skills"),
+            "Check current global skills"
+        );
+        assert_eq!(
+            strip_status_glyph("⠐ Review project rules and guidelines"),
+            "Review project rules and guidelines"
+        );
+        assert_eq!(strip_status_glyph("⣿ working"), "working");
+        // A user-set name has no glyph and must survive intact.
+        assert_eq!(strip_status_glyph("gtm-studio"), "gtm-studio");
+        assert_eq!(strip_status_glyph("  padded  "), "padded");
+        assert_eq!(strip_status_glyph(""), "");
+        // A name that merely STARTS with a letter/emoji must not lose its first char.
+        assert_eq!(strip_status_glyph("rules"), "rules");
+        assert_eq!(strip_status_glyph("🚀 launch"), "🚀 launch");
     }
 
     #[test]
@@ -221,12 +285,12 @@ mod tests {
 
     #[test]
     fn malformed_rows_are_skipped_not_fatal() {
-        let input = b"good-id\t1\t2\t/tmp\n\
+        let input = b"good-id\t1\t2\tstream-a\t/tmp\n\
                       \n\
                       missing-fields\n\
-                      bad-index\tX\t2\t/tmp\n\
-                      \t1\t1\t/tmp\n\
-                      other-id\t2\t3\t/var\n";
+                      bad-index\tX\t2\tstream-b\t/tmp\n\
+                      \t1\t1\tstream-c\t/tmp\n\
+                      other-id\t2\t3\tstream-d\t/var\n";
         let surfaces = parse_list(input);
         assert_eq!(surfaces.len(), 2, "only the two well-formed rows survive");
         assert_eq!(surfaces[0].id, "good-id");
@@ -246,7 +310,7 @@ mod tests {
         use crate::runner::CannedRunner;
         let runner = CannedRunner::new(FIXTURE.to_vec());
         let surfaces = list(&runner).await.expect("canned bytes parse");
-        assert_eq!(surfaces.len(), 4);
+        assert_eq!(surfaces.len(), 7);
         let spec = runner.last_spec().expect("one call");
         assert_eq!(spec.program, "osascript");
     }
@@ -299,7 +363,7 @@ mod tests {
         let mut cache = SurfaceCache::default();
         let good = parse_list(FIXTURE);
         let (rows, err) = cache.fold(Ok(good.clone()));
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.len(), 7);
         assert!(err.is_none());
 
         let (rows, err) = cache.fold(Err(AppError::Timeout {
@@ -316,8 +380,12 @@ mod tests {
     #[test]
     fn a_cwd_containing_spaces_survives() {
         // Tab-separated, not space-separated, precisely so this works.
-        let surfaces = parse_list(b"id-1\t1\t1\t/Users/user/My Projects/a b\n");
+        let surfaces = parse_list(b"id-1\t1\t1\tmy stream\t/Users/user/My Projects/a b\n");
         assert_eq!(surfaces[0].cwd, "/Users/user/My Projects/a b");
+        assert_eq!(
+            surfaces[0].name, "my stream",
+            "a workstream name may contain spaces too"
+        );
     }
 
     #[test]

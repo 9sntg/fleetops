@@ -21,6 +21,7 @@ mod discovery;
 mod doctor;
 mod error;
 mod fold;
+mod git;
 mod highlight;
 mod paths;
 mod procsrc;

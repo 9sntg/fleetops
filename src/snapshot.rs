@@ -140,10 +140,13 @@ mod tests {
             context_tokens: tokens,
             ctx_pct,
             secs_since_append: Some(3),
+            stream: Some("gtm-studio".to_string()),
+            branch: Some("main".to_string()),
             pane: Some(MatchedPane {
                 surface_id: surface_id.to_string(),
                 window_index: 1,
                 tab_index,
+                stream: "a-stream".to_string(),
             }),
             pts: None,
         }
@@ -159,6 +162,8 @@ mod tests {
             context_tokens: None,
             ctx_pct: None,
             secs_since_append: None,
+            stream: None,
+            branch: None,
             pane: None,
             pts: None,
         }

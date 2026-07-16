@@ -7,8 +7,8 @@
 //!
 //! Key responsibilities:
 //! - Board table: `#` (agent board number `n`, 1-based row order — the same `n` the snapshot
-//!   emits; spec 010) | status | dir (badge: emoji + last cwd folder) | session | ctx% | tokens |
-//!   account | age | pane.
+//!   emits; spec 010) | status | dir (badge: emoji + last cwd folder) | stream (cmux workstream)
+//!   | branch | session | ctx% | tokens | account | age | pane.
 //! - Stable per-account color (hash into a 6-color palette); stable per-dir emoji+color badge
 //!   (two independently-seeded hashes); status color from one pure map.
 //! - Footer: session count, needs-answer count, refresh age, key hints, last error, and a
@@ -111,6 +111,28 @@ fn dir_badge(dir: &str) -> (char, Color) {
     (emoji, color)
 }
 
+/// STREAM column width; BRANCH is wider because `feat/…` prefixes are common.
+const STREAM_WIDTH: u16 = 16;
+const BRANCH_WIDTH: u16 = 18;
+
+/// STREAM / BRANCH: present or `—`. Both are optional facts about a session, never errors —
+/// no cmux surface means no workstream; a cwd outside a repo has no branch (spec 015).
+///
+/// Over-long values are truncated with an ellipsis rather than silently clipped: ratatui would
+/// render `feat/email-signal-`, which reads as a real branch name and isn't one. `…` says the
+/// name continues. Width counts chars, not bytes — a name may be non-ASCII.
+fn optional_cell(value: Option<&String>, width: u16) -> String {
+    let Some(v) = value else {
+        return "—".to_string();
+    };
+    let width = usize::from(width);
+    if v.chars().count() <= width {
+        return v.clone();
+    }
+    let kept: String = v.chars().take(width.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
+
 /// The PANE column: the session's cmux tab number, or `—` when it doesn't render in a cmux
 /// surface (started in another terminal). Exact-id matching leaves no ambiguous case to show
 /// (spec 012 retired the wave-5 `≈?` marker along with the title/cwd tie-breaks).
@@ -156,7 +178,7 @@ fn age_style(secs: u64) -> Style {
 
 fn render_table(f: &mut Frame<'_>, area: Rect, app: &App) {
     let header = Row::new([
-        "#", "STATUS", "DIR", "SESSION", "CTX", "TOK", "ACCT", "AGE", "PANE",
+        "#", "STATUS", "DIR", "STREAM", "BRANCH", "SESSION", "CTX", "TOK", "ACCT", "AGE", "PANE",
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
     let selected = app.selected_index();
@@ -192,6 +214,9 @@ fn render_table(f: &mut Frame<'_>, area: Rect, app: &App) {
             Cell::from((i + 1).to_string()),
             Cell::from(label).style(style),
             Cell::from(format!("{dir_emoji} {dir}")).style(Style::default().fg(dir_color)),
+            Cell::from(optional_cell(r.stream.as_ref(), STREAM_WIDTH)),
+            Cell::from(optional_cell(r.branch.as_ref(), BRANCH_WIDTH))
+                .style(Style::default().fg(Color::Blue)),
             Cell::from(r.name.clone()),
             ctx_cell,
             Cell::from(tok),
@@ -214,6 +239,10 @@ fn render_table(f: &mut Frame<'_>, area: Rect, app: &App) {
             // the badge column collapsed entirely (live-verified at 80 cols — DIR lost to
             // SESSION's Min). 14 = emoji(2) + space + 11 chars ("tokenomics" fits).
             Constraint::Length(14),
+            // STREAM + BRANCH: fixed like DIR, for the same live-verified reason — flexible
+            // columns get squeezed first and these would collapse before SESSION does.
+            Constraint::Length(STREAM_WIDTH),
+            Constraint::Length(BRANCH_WIDTH),
             Constraint::Min(24),
             Constraint::Length(10),
             Constraint::Length(5),
@@ -273,6 +302,12 @@ fn render_footer(f: &mut Frame<'_>, area: Rect, app: &App) {
 
 #[cfg(test)]
 mod tests {
+    /// The width the board needs once every fixed column fits: 3+10+14+16+18+24+10+5+8+4+5,
+    /// plus 10 inter-column gaps and 2 borders (spec 015 widened this from 93 by adding
+    /// STREAM+BRANCH). Rendering narrower is fine — ratatui squeezes — but the column-fitting
+    /// assertions below are about the designed width.
+    const BOARD_MIN_COLS: u16 = 129;
+
     use super::*;
     use crate::discovery::ScanStats;
     use crate::telemetry::ctx_used_pct;
@@ -296,17 +331,20 @@ mod tests {
             context_tokens: tokens,
             ctx_pct: tokens.map(ctx_pct_for),
             secs_since_append: Some(75),
+            stream: Some("gtm-studio".to_string()),
+            branch: Some("feat/x".to_string()),
             pane: Some(crate::board::MatchedPane {
                 surface_id: "uuid-47".to_string(),
                 window_index: 1,
                 tab_index: 2,
+                stream: "gtm-studio".to_string(),
             }),
             pts: None,
         }
     }
 
     fn rendered(app: &App) -> String {
-        let backend = TestBackend::new(120, 12);
+        let backend = TestBackend::new(BOARD_MIN_COLS, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(f, app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -432,6 +470,64 @@ mod tests {
             .map(|a| format!("{:?}", account_color(a)))
             .collect();
         assert_eq!(distinct.len(), 6, "all six accounts distinct: {distinct:?}");
+    }
+
+    #[test]
+    fn stream_and_branch_render_between_dir_and_session() {
+        let mut app = App::default();
+        app.update(Msg::Snapshot(Box::new(Snapshot {
+            rows: vec![row("s1", Status::Idle, "a session", Some(50_000))],
+            ..Snapshot::default()
+        })));
+        let screen = rendered(&app);
+        assert!(screen.contains("STREAM"), "STREAM header");
+        assert!(screen.contains("BRANCH"), "BRANCH header");
+        // Order matters: the maintainer asked for them BETWEEN dir and session (spec 015).
+        let header = screen
+            .lines()
+            .find(|l| l.contains("STATUS"))
+            .expect("header row");
+        let at = |c: &str| header.find(c).expect("column present");
+        assert!(at("DIR") < at("STREAM"), "STREAM sits after DIR");
+        assert!(at("STREAM") < at("BRANCH"));
+        assert!(at("BRANCH") < at("SESSION"), "BRANCH sits before SESSION");
+        assert!(screen.contains("gtm-studio"), "the workstream name renders");
+        assert!(screen.contains("feat/x"), "the branch renders");
+    }
+
+    #[test]
+    fn a_session_with_no_stream_or_branch_renders_placeholders() {
+        // Not in a cmux surface, cwd not a repo — both are normal, neither is an error.
+        let mut app = App::default();
+        let mut r = row("s1", Status::Idle, "a session", Some(50_000));
+        r.pane = None;
+        r.stream = None;
+        r.branch = None;
+        app.update(Msg::Snapshot(Box::new(Snapshot {
+            rows: vec![r],
+            ..Snapshot::default()
+        })));
+        let screen = rendered(&app);
+        assert!(screen.contains('—'), "placeholders, not blanks or errors");
+    }
+
+    #[test]
+    fn an_overlong_branch_is_ellipsised_not_silently_clipped() {
+        // A clipped "feat/email-signal-" reads as a real branch name and isn't one.
+        let long = "feat/email-signal-capture-and-more".to_string();
+        let cell = optional_cell(Some(&long), BRANCH_WIDTH);
+        assert!(cell.ends_with('…'), "truncation must be visible: {cell}");
+        assert_eq!(cell.chars().count(), usize::from(BRANCH_WIDTH));
+        // Exactly-at-width is not truncated.
+        let exact: String = "x".repeat(usize::from(BRANCH_WIDTH));
+        assert_eq!(optional_cell(Some(&exact), BRANCH_WIDTH), exact);
+        assert_eq!(optional_cell(None, BRANCH_WIDTH), "—");
+        // Char-based, not byte-based: a multi-byte name must not panic or mis-measure.
+        let wide = "🚀".repeat(40);
+        assert_eq!(
+            optional_cell(Some(&wide), BRANCH_WIDTH).chars().count(),
+            usize::from(BRANCH_WIDTH)
+        );
     }
 
     #[test]
