@@ -111,12 +111,13 @@ fn dir_badge(dir: &str) -> (char, Color) {
     (emoji, color)
 }
 
+/// The PANE column: the session's cmux tab number, or `—` when it doesn't render in a cmux
+/// surface (started in another terminal). Exact-id matching leaves no ambiguous case to show
+/// (spec 012 retired the wave-5 `≈?` marker along with the title/cwd tie-breaks).
 fn pane_cell(row: &SessionRow) -> String {
-    match (&row.pane, row.pane_ambiguous) {
-        (Some(p), _) => p.pane_id.to_string(),
-        (None, true) => "≈?".to_string(),
-        (None, false) => "—".to_string(),
-    }
+    row.pane
+        .as_ref()
+        .map_or_else(|| "—".to_string(), |p| p.tab_index.to_string())
 }
 
 /// Context gauge width in cells.
@@ -296,12 +297,10 @@ mod tests {
             ctx_pct: tokens.map(ctx_pct_for),
             secs_since_append: Some(75),
             pane: Some(crate::board::MatchedPane {
-                socket: String::new(),
-                tab_id: 3,
-                pane_id: 47,
+                surface_id: "uuid-47".to_string(),
+                window_index: 1,
                 tab_index: 2,
             }),
-            pane_ambiguous: false,
             pts: None,
         }
     }
@@ -356,7 +355,10 @@ mod tests {
         assert!(screen.contains("117k"));
         assert!(screen.contains("1m"), "75s age humanized");
         assert!(screen.contains('#'), "leading # agent-number column");
-        assert!(screen.contains("47"), "pane id column");
+        assert!(
+            screen.contains('2'),
+            "PANE column shows the cmux tab number"
+        );
         assert!(screen.contains("DIR"));
         assert!(
             !screen.contains("/tui/fleetops"),

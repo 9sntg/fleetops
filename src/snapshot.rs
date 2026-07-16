@@ -2,13 +2,13 @@
 //!
 //! Project: Fleetops — TUI monitoring all running Claude Code sessions (the fleet)
 //! Module:  src/snapshot.rs
-//! Deps:    serde/serde_json (already deps); collect, panes, board, runner
+//! Deps:    serde/serde_json (already deps); collect, cmux, board, runner
 //! Tested:  inline `#[cfg(test)]` — `render_json` field shape / order / nulls (pure surface)
 //!
 //! Key responsibilities:
 //! - Gather EXACTLY the board's rows, in the same order, via the shared `collect::collect`
 //!   pipeline (never a second data path — the snapshot and the live board can't disagree).
-//! - Read `focused_pane_id` from `wezterm cli list-clients` (the least-idle client) and serialize
+//! - Read the focused surface from cmux (AppleScript) and serialize
 //!   the spec-009 JSON contract with `serde_json`.
 //!
 //! Design constraints:
@@ -20,12 +20,12 @@ use serde::Serialize;
 
 use crate::board::SessionRow;
 use crate::runner::Runner;
-use crate::{collect, panes};
+use crate::{cmux, collect};
 
 /// The spec-009 JSON document.
 #[derive(Debug, Serialize)]
 struct SnapshotJson {
-    focused_pane_id: Option<u64>,
+    focused_surface_id: Option<String>,
     sessions: Vec<SessionJson>,
 }
 
@@ -42,14 +42,14 @@ struct SessionJson {
     /// Seconds since the transcript last appended (`SessionRow.secs_since_append`); the raw age
     /// the board's AGE column humanizes. `null` when unknown (spec 010).
     age_secs: Option<u64>,
-    pane_id: Option<u64>,
-    tab_index: Option<u64>,
+    surface_id: Option<String>,
+    tab_index: Option<u32>,
     cwd: String,
     session_id: String,
 }
 
-/// Render the contract JSON from the focused pane + the assembled rows (pure).
-fn render_json(focused_pane_id: Option<u64>, rows: &[SessionRow]) -> String {
+/// Render the contract JSON from the focused surface + the assembled rows (pure).
+fn render_json(focused_surface_id: Option<String>, rows: &[SessionRow]) -> String {
     let sessions = rows
         .iter()
         .enumerate()
@@ -60,7 +60,7 @@ fn render_json(focused_pane_id: Option<u64>, rows: &[SessionRow]) -> String {
             tokens: r.context_tokens,
             ctx_pct: r.ctx_pct,
             age_secs: r.secs_since_append,
-            pane_id: r.pane.as_ref().map(|p| p.pane_id),
+            surface_id: r.pane.as_ref().map(|p| p.surface_id.clone()),
             tab_index: r.pane.as_ref().map(|p| p.tab_index),
             cwd: r.cwd.clone(),
             session_id: r.session_id.clone(),
@@ -68,7 +68,7 @@ fn render_json(focused_pane_id: Option<u64>, rows: &[SessionRow]) -> String {
         .collect();
     // Serializing our own owned data never fails; the fallback keeps this off the `unwrap` path.
     serde_json::to_string_pretty(&SnapshotJson {
-        focused_pane_id,
+        focused_surface_id,
         sessions,
     })
     .unwrap_or_else(|_| "{}".to_string())
@@ -77,17 +77,23 @@ fn render_json(focused_pane_id: Option<u64>, rows: &[SessionRow]) -> String {
 /// Gather the snapshot and render it. Returns `(json, scan_ok)` — `scan_ok == false` (sessions
 /// dir unreadable or the scan task crashed) means exit non-zero, exactly like `fleet doctor`.
 pub async fn run(runner: &dyn Runner) -> (String, bool) {
-    // Focused pane, the pane list and the process table are independent — fetch concurrently.
-    let (focused, panes_result, procs_result) = tokio::join!(
-        panes::focused_pane_id(runner),
-        panes::list_all_panes(runner),
+    // The focused surface, the topology and the process table are independent — fetch
+    // concurrently.
+    let (focused, surfaces_result, procs_result) = tokio::join!(
+        cmux::focused_surface_id(runner),
+        cmux::list(runner),
         crate::procsrc::fetch(runner)
     );
     let collected = tokio::task::spawn_blocking(move || {
         // Fresh caches: a one-shot has nothing to reuse across sweeps.
         let mut tails = crate::telemetry::TailCache::default();
-        let mut pane_cache = crate::panes::PaneCache::default();
-        collect::collect(&mut tails, &mut pane_cache, panes_result, procs_result)
+        let mut surface_cache = crate::cmux::SurfaceCache::default();
+        collect::collect(
+            &mut tails,
+            &mut surface_cache,
+            surfaces_result,
+            procs_result,
+        )
     })
     .await;
     match collected {
@@ -116,8 +122,8 @@ mod tests {
         name: &str,
         tokens: Option<u64>,
         ctx_pct: Option<u8>,
-        pane_id: u64,
-        tab_index: u64,
+        surface_id: &str,
+        tab_index: u32,
     ) -> SessionRow {
         SessionRow {
             session_id: id.to_string(),
@@ -129,12 +135,10 @@ mod tests {
             ctx_pct,
             secs_since_append: Some(3),
             pane: Some(MatchedPane {
-                socket: String::new(),
-                tab_id: 3,
-                pane_id,
+                surface_id: surface_id.to_string(),
+                window_index: 1,
                 tab_index,
             }),
-            pane_ambiguous: false,
             pts: None,
         }
     }
@@ -150,7 +154,6 @@ mod tests {
             ctx_pct: None,
             secs_since_append: None,
             pane: None,
-            pane_ambiguous: false,
             pts: None,
         }
     }
@@ -164,15 +167,15 @@ mod tests {
                 "Pick an option",
                 Some(120_000),
                 Some(60),
-                47,
+                "uuid-47",
                 1,
             ),
             unmatched_row("s2", Status::Working, "young session"),
         ];
-        let json = render_json(Some(21), &rows);
+        let json = render_json(Some("uuid-focused".to_string()), &rows);
         let v: Value = serde_json::from_str(&json).expect("valid JSON");
 
-        assert_eq!(v["focused_pane_id"], 21);
+        assert_eq!(v["focused_surface_id"], "uuid-focused");
         let s = &v["sessions"];
         assert_eq!(s.as_array().expect("array").len(), 2);
 
@@ -183,12 +186,12 @@ mod tests {
         assert_eq!(s[0]["tokens"], 120_000);
         assert_eq!(s[0]["ctx_pct"], 60);
         assert_eq!(s[0]["age_secs"], 3, "age_secs = secs_since_append");
-        assert_eq!(s[0]["pane_id"], 47);
+        assert_eq!(s[0]["surface_id"], "uuid-47");
         assert_eq!(s[0]["tab_index"], 1);
         assert_eq!(s[0]["cwd"], "/tui/fleetops");
         assert_eq!(s[0]["session_id"], "s1");
 
-        // Row 1: unmatched → pane_id/tab_index/tokens/ctx_pct/age_secs all null; n advances.
+        // Row 1: unmatched → surface_id/tab_index/tokens/ctx_pct/age_secs all null; n advances.
         assert_eq!(s[1]["n"], 2);
         assert_eq!(s[1]["status"], "Working");
         assert!(s[1]["tokens"].is_null());
@@ -197,15 +200,15 @@ mod tests {
             s[1]["age_secs"].is_null(),
             "no age when secs_since_append is None"
         );
-        assert!(s[1]["pane_id"].is_null());
+        assert!(s[1]["surface_id"].is_null());
         assert!(s[1]["tab_index"].is_null());
     }
 
     #[test]
-    fn render_json_zero_sessions_and_no_focused_pane_is_valid() {
+    fn render_json_zero_sessions_and_no_focused_surface_is_valid() {
         let json = render_json(None, &[]);
         let v: Value = serde_json::from_str(&json).expect("valid JSON");
-        assert!(v["focused_pane_id"].is_null());
+        assert!(v["focused_surface_id"].is_null());
         assert_eq!(v["sessions"].as_array().expect("array").len(), 0);
     }
 }

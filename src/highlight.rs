@@ -12,8 +12,9 @@
 //! Key responsibilities:
 //! - `desired_tint`: Status -> Tint (spec 006 table). `Idle` maps to `None` here — green
 //!   stickiness/the finish-pulse transition is the model's job, it owns prev-status.
-//! - Exact OSC 11 (set) / OSC 111 (reset) escape bytes — verified live through ConPTY on this
-//!   box (probe 2026-07-10, `plans/002-pane-highlight/`).
+//! - Exact OSC 11 (set) / OSC 111 (reset) escape bytes — verified live through ConPTY on the
+//!   original WSL2 box (probe 2026-07-10, `plans/002-pane-highlight/`), and re-verified against
+//!   a real Darwin pty in wave 13.
 //! - `HighlightCmd`: what the loop must write, and to which pts.
 //! - `spawn_apply`/`reset_all`: the detached writer — best-effort pts writes, never surfaced
 //!   as an error (a dead pane is normal).
@@ -59,7 +60,7 @@ pub enum Tint {
 pub enum HighlightCmd {
     /// Hold a steady tint. `tint: Tint::None` writes an OSC 111 reset instead of a color.
     Steady {
-        /// Target pts path (e.g. `/dev/pts/7`).
+        /// Target pts path (e.g. `/dev/ttys007`).
         pts: String,
         /// Desired steady tint.
         tint: Tint,
@@ -108,10 +109,15 @@ pub const fn osc_reset() -> &'static [u8] {
 
 // --- writer: detached, best-effort OSC pane-tint writes (spec 006) ------------------------
 
-// Linux asm-generic fcntl flag values (octal) — avoids a `libc` dependency for two constants;
-// this crate is WSL2/Linux-only by design (spec 006: no new dependency for the writer).
-const O_NOCTTY: i32 = 0o400;
-const O_NONBLOCK: i32 = 0o4000;
+// Darwin (`sys/fcntl.h`) fcntl flag values — avoids a `libc` dependency for two constants;
+// this crate is macOS-only by design (spec 006: no new dependency for the writer).
+//
+// These were WRONG until wave 13: they held Linux's asm-generic values (0o400 / 0o4000), which
+// on Darwin mean O_NOFOLLOW and O_EXCL. The open would not have failed loudly — it would have
+// requested the wrong semantics, and `write_bytes` swallows every error by design, so the
+// highlight would simply have misbehaved in silence.
+const O_NOCTTY: i32 = 0x0002_0000;
+const O_NONBLOCK: i32 = 0x0000_0004;
 
 /// Delay between `Pulse` frames — six frames alternate bright/dim green over ~1 s (spec 006).
 const PULSE_FRAME_INTERVAL: Duration = Duration::from_millis(160);
@@ -221,6 +227,24 @@ mod tests {
     }
 
     #[test]
+    fn fcntl_flags_are_the_darwin_values_not_linuxs() {
+        // Regression pin (wave 13). These held Linux's asm-generic values through wave 12. On
+        // Darwin those numbers name DIFFERENT flags, so the open silently requested the wrong
+        // semantics — and since `write_bytes` drops every error by design, nothing would have
+        // reported it. Ground truth: Darwin sys/fcntl.h.
+        assert_eq!(O_NONBLOCK, 0x0000_0004, "Darwin O_NONBLOCK");
+        assert_eq!(O_NOCTTY, 0x0002_0000, "Darwin O_NOCTTY");
+        assert_ne!(
+            O_NONBLOCK, 0o4000,
+            "0o4000 is Linux's; on Darwin it is O_EXCL"
+        );
+        assert_ne!(
+            O_NOCTTY, 0o400,
+            "0o400 is Linux's; on Darwin it is O_NOFOLLOW"
+        );
+    }
+
+    #[test]
     fn osc_set_exact_bytes() {
         assert_eq!(osc_set(AMBER), b"\x1b]11;#453000\x1b\\".to_vec());
         assert_eq!(osc_set(RED), b"\x1b]11;#3a0d0d\x1b\\".to_vec());
@@ -234,8 +258,8 @@ mod tests {
     }
 
     /// Manual live-verify harness against a real pts (spec 006's "escape lane" probe). Not run
-    /// by `cargo test`/CI — opt in with `FLEET_PROBE_PTS=/dev/pts/N cargo test -- --ignored`
-    /// against a scratch wezterm pane, never a live session's pane.
+    /// by `cargo test`/CI — opt in with `FLEET_PROBE_PTS=/dev/ttysNNN cargo test -- --ignored`
+    /// against a scratch terminal, never a live session's surface.
     #[test]
     #[ignore = "manual probe: writes real escape sequences to a live pts"]
     fn live_probe_amber_pulse_reset() {

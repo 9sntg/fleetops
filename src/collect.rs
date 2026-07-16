@@ -22,9 +22,9 @@
 use std::path::Path;
 
 use crate::board::{self, SessionRow};
+use crate::cmux::{Surface, SurfaceCache};
 use crate::discovery::{self, ScanStats};
 use crate::error::AppResult;
-use crate::panes::{PaneCache, PaneRow};
 use crate::procsrc::ProcTable;
 use crate::telemetry::{TailCache, Telemetry};
 use crate::{codex, paths};
@@ -36,7 +36,7 @@ pub struct Collected {
     pub rows: Vec<SessionRow>,
     /// Discovery tallies (footer + doctor + snapshot exit code).
     pub stats: ScanStats,
-    /// A degraded lane (e.g. wezterm unreachable) — rows are still valid.
+    /// A degraded lane (e.g. cmux unreachable) — rows are still valid.
     pub lane_error: Option<String>,
     /// Live Codex rows folded into `rows` this pass (footer `· N codex`).
     pub codex_count: usize,
@@ -46,8 +46,8 @@ pub struct Collected {
 /// `procs_result` are already fetched by the caller (both off the blocking task).
 pub fn collect(
     tails: &mut TailCache,
-    pane_cache: &mut PaneCache,
-    panes_result: AppResult<(Vec<PaneRow>, Option<String>)>,
+    surface_cache: &mut SurfaceCache,
+    surfaces_result: AppResult<Vec<Surface>>,
     procs_result: AppResult<ProcTable>,
 ) -> Collected {
     let claude_dir = paths::claude_dir();
@@ -69,12 +69,12 @@ pub fn collect(
         .map(|s| s.file.session_id.as_str())
         .collect();
     tails.retain(&live_ids);
-    let (pane_rows, pane_error) = pane_cache.fold(panes_result);
-    // A dead process table empties the board; a degraded pane lane only costs the PANE column.
+    let (surfaces, surface_error) = surface_cache.fold(surfaces_result);
+    // A dead process table empties the board; a degraded cmux lane only costs the PANE column.
     // Surface the more severe one.
-    let lane_error = proc_error.or(pane_error);
-    let mut rows = board::assemble(&sessions, &telemetry, &pane_rows);
-    let codex_rows = codex::scan(&paths::codex_dir(), Path::new("/proc"), &pane_rows);
+    let lane_error = proc_error.or(surface_error);
+    let mut rows = board::assemble(&sessions, &telemetry, &surfaces);
+    let codex_rows = codex::scan(&paths::codex_dir(), Path::new("/proc"), &surfaces);
     let codex_count = codex_rows.len();
     rows.extend(codex_rows);
     board::sort_rows(&mut rows);

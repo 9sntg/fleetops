@@ -2,11 +2,11 @@
 //!
 //! Project: Fleetops — TUI monitoring all running Claude Code sessions (the fleet)
 //! Module:  src/doctor.rs
-//! Deps:    discovery, telemetry, board, panes, runner, paths, procsrc
+//! Deps:    discovery, telemetry, board, cmux, runner, paths, procsrc
 //! Tested:  inline `#[cfg(test)]` — report rendered pure from canned `DoctorFacts`
 //!
 //! Key responsibilities:
-//! - Gather live samples (sessions scan, transcript presence, pane match, wezterm reachability).
+//! - Gather live samples (sessions scan, transcript presence, surface match, cmux reachability).
 //! - Render a human report; surface unknown status strings and parse failures (assumption A1/A2 drift).
 //!
 //! Design constraints:
@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 use crate::discovery::{self, NativeStatus, ScanStats};
 use crate::runner::Runner;
 use crate::telemetry::TailCache;
-use crate::{board, panes, paths, procsrc};
+use crate::{board, cmux, paths, procsrc};
 
 /// Everything the report renders — gathered once, rendered pure.
 #[derive(Debug)]
@@ -31,14 +31,10 @@ pub struct DoctorFacts {
     pub versions: BTreeSet<String>,
     /// Per live session: (name, transcript found, account attributed, pane matched).
     pub sessions: Vec<(String, bool, bool, bool)>,
-    /// Sessions carrying exact WSLENV pane identity (spec 005).
+    /// Sessions carrying an exact cmux surface identity (`CMUX_SURFACE_ID`, spec 012).
     pub exact_panes: usize,
-    /// Live wezterm instances discovered (tasklist × socket files).
-    pub instances: usize,
-    /// Ok(pane count) or the wezterm failure.
-    pub wezterm: Result<usize, String>,
-    /// One instance answered, another failed — the pane list is partial.
-    pub instance_error: Option<String>,
+    /// Ok(surface count) or the cmux failure.
+    pub cmux: Result<usize, String>,
     /// The `ps` process table could not be fetched — liveness is unknowable, so every session
     /// reads as dead. An empty board here is a broken sensor, not an empty fleet.
     pub procs_error: Option<String>,
@@ -52,9 +48,7 @@ impl Default for DoctorFacts {
             versions: BTreeSet::new(),
             sessions: Vec::new(),
             exact_panes: 0,
-            instances: 0,
-            wezterm: Err("not checked".to_string()),
-            instance_error: None,
+            cmux: Err("not checked".to_string()),
             procs_error: None,
         }
     }
@@ -104,29 +98,21 @@ pub fn render_report(facts: &DoctorFacts) -> String {
     let _ = writeln!(out, "cc versions in live files: {versions}");
     let _ = writeln!(
         out,
-        "pane identity: {} of {} sessions exact (WSLENV WEZTERM_PANE)",
+        "pane identity: {} of {} sessions exact (CMUX_SURFACE_ID)",
         facts.exact_panes,
         facts.sessions.len()
     );
-    match &facts.wezterm {
+    match &facts.cmux {
         Ok(count) => {
-            let _ = writeln!(
-                out,
-                "wezterm: {} instances · {count} Claude panes",
-                facts.instances
-            );
+            let _ = writeln!(out, "cmux: {count} terminals");
         }
         Err(e) => {
-            let _ = writeln!(
-                out,
-                "  ⚠ wezterm unreachable: {e} — jump lane degraded (A2)"
-            );
+            let _ = writeln!(out, "  ⚠ cmux unreachable: {e} — jump lane degraded (A2)");
         }
     }
-    if let Some(e) = &facts.instance_error {
-        let _ = writeln!(
-            out,
-            "  ⚠ instance degraded: {e} — pane list is PARTIAL, counts above undercount"
+    if facts.exact_panes == 0 && !facts.sessions.is_empty() && facts.cmux.is_ok() {
+        out.push_str(
+            "  ⚠ no session carries CMUX_SURFACE_ID — sessions started outside cmux cannot be jumped to\n",
         );
     }
     let _ = writeln!(out, "\nlive sessions ({}):", facts.sessions.len());
@@ -148,10 +134,9 @@ pub fn render_report(facts: &DoctorFacts) -> String {
 /// either the sessions dir was unreadable or the `ps` process table was unavailable.
 pub async fn run(runner: &dyn Runner) -> (String, bool) {
     let claude_dir = paths::claude_dir();
-    let instances = panes::discover_sockets(runner).await.map_or(0, |s| s.len());
-    let (wezterm, pane_list, instance_error) = match panes::list_all_panes(runner).await {
-        Ok((rows, partial)) => (Ok(rows.len()), rows, partial),
-        Err(e) => (Err(e.to_string()), Vec::new(), None),
+    let (cmux_count, surfaces) = match cmux::list(runner).await {
+        Ok(surfaces) => (Ok(surfaces.len()), surfaces),
+        Err(e) => (Err(e.to_string()), Vec::new()),
     };
     // Liveness comes from `ps`; a failure here means every session reads as dead, which must
     // never be reported as a clean, empty fleet.
@@ -167,9 +152,7 @@ pub async fn run(runner: &dyn Runner) -> (String, bool) {
         let projects = claude_dir.join("projects");
         let mut facts = DoctorFacts {
             scan,
-            instances,
-            wezterm,
-            instance_error,
+            cmux: cmux_count,
             procs_error,
             ..DoctorFacts::default()
         };
@@ -181,20 +164,10 @@ pub async fn run(runner: &dyn Runner) -> (String, bool) {
                 facts.versions.insert(v.clone());
             }
             let telemetry = cache.read(&projects, &s.file.cwd, &s.file.session_id);
-            let ai_title = telemetry
-                .facts
-                .as_ref()
-                .and_then(|f| f.ai_title.clone())
-                .unwrap_or_default();
-            if s.wezterm_pane.is_some() {
+            if s.surface_id.is_some() {
                 facts.exact_panes += 1;
             }
-            let (pane, _) = board::match_pane(
-                s.wezterm_pane,
-                &s.file.cwd,
-                &[&ai_title, &s.file.name],
-                &pane_list,
-            );
+            let pane = board::match_surface(s.surface_id.as_deref(), &surfaces);
             // facts is Some iff the transcript existed and was readable (TailCache::read).
             facts.sessions.push((
                 s.file.name.clone(),
@@ -234,8 +207,7 @@ mod tests {
             versions: ["2.1.206".to_string()].into(),
             sessions: vec![("fleetops".to_string(), true, true, true)],
             exact_panes: 1,
-            wezterm: Ok(23),
-            instances: 2,
+            cmux: Ok(4),
             ..DoctorFacts::default()
         };
         let report = render_report(&facts);
@@ -243,8 +215,8 @@ mod tests {
         assert!(report.contains("all known"));
         assert!(report.contains("2.1.206"));
         // Spec 005: the pane-identity adoption line.
-        assert!(report.contains("pane identity: 1 of 1 sessions exact (WSLENV WEZTERM_PANE)"));
-        assert!(report.contains("2 instances · 23 Claude panes"));
+        assert!(report.contains("pane identity: 1 of 1 sessions exact (CMUX_SURFACE_ID)"));
+        assert!(report.contains("cmux: 4 terminals"));
         assert!(report.contains("✓ transcript · ✓ account · ✓ pane — fleetops"));
         assert!(!report.contains('⚠'));
     }
@@ -261,18 +233,13 @@ mod tests {
             },
             unknown_statuses: ["pondering".to_string()].into(),
             sessions: vec![("mystery".to_string(), false, false, false)],
-            wezterm: Err("wezterm.exe: timed out after 5s".to_string()),
-            instance_error: Some("gui-sock-3428: timed out after 5s".to_string()),
+            cmux: Err("osascript: timed out after 5s".to_string()),
             ..DoctorFacts::default()
         };
         let report = render_report(&facts);
         assert!(report.contains("parse failures"));
         assert!(report.contains("pondering"));
-        assert!(report.contains("wezterm unreachable"));
-        assert!(
-            report.contains("instance degraded"),
-            "partial pane list is a drift class"
-        );
+        assert!(report.contains("cmux unreachable"));
         assert!(report.contains("✗ transcript · ✗ account · ✗ pane — mystery"));
     }
 

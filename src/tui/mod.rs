@@ -29,11 +29,11 @@ use crossterm::event::{Event, EventStream};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
+use crate::cmux::SurfaceCache;
 use crate::error::AppResult;
-use crate::panes::PaneCache;
 use crate::runner::{Exec, Runner};
 use crate::telemetry::TailCache;
-use crate::{board, collect, highlight, panes, procsrc};
+use crate::{board, cmux, collect, highlight, procsrc};
 
 use model::{App, Msg, Snapshot};
 
@@ -41,7 +41,7 @@ use model::{App, Msg, Snapshot};
 #[derive(Debug, Default)]
 struct SweepCaches {
     tails: TailCache,
-    panes: PaneCache,
+    surfaces: SurfaceCache,
 }
 
 /// Sensor sweep cadence (spec 001: ~2 s).
@@ -168,8 +168,7 @@ fn spawn_sweep(
 /// board and the snapshot can never disagree (spec 009).
 async fn sweep(runner: &dyn Runner, cache: &Arc<Mutex<SweepCaches>>) -> Result<Snapshot, String> {
     // Independent lanes — fetch concurrently.
-    let (panes_result, procs_result) =
-        tokio::join!(panes::list_all_panes(runner), procsrc::fetch(runner));
+    let (surfaces_result, procs_result) = tokio::join!(cmux::list(runner), procsrc::fetch(runner));
     let cache = Arc::clone(cache);
     tokio::task::spawn_blocking(move || {
         let mut guard = match cache.lock() {
@@ -178,8 +177,8 @@ async fn sweep(runner: &dyn Runner, cache: &Arc<Mutex<SweepCaches>>) -> Result<S
         };
         // `collect` is the SAME pipeline `snapshot::run` uses, so the board and the snapshot
         // can never disagree (spec 009). The caches are held only for its duration, then dropped.
-        let SweepCaches { tails, panes } = &mut *guard;
-        let collected = collect::collect(tails, panes, panes_result, procs_result);
+        let SweepCaches { tails, surfaces } = &mut *guard;
+        let collected = collect::collect(tails, surfaces, surfaces_result, procs_result);
         drop(guard); // release the caches before returning (lock-contention hygiene)
         Snapshot {
             seq: 0, // stamped by spawn_sweep
@@ -194,22 +193,13 @@ async fn sweep(runner: &dyn Runner, cache: &Arc<Mutex<SweepCaches>>) -> Result<S
 }
 
 /// Fire the jump off the UI task; only failures surface (as a footer `Msg::Error`).
-/// Tab first, then pane: activate-pane alone focuses within a tab but doesn't switch tabs.
-/// Both commands target the pane's own wezterm instance via its socket.
+/// One call: cmux's `focus` brings the surface's window to the front AND focuses it, so the
+/// wezterm-era activate-tab→activate-pane ordering hazard is gone (spec 012).
 fn spawn_jump(runner: &Arc<dyn Runner>, tx: &mpsc::Sender<Msg>, target: board::MatchedPane) {
     let runner = Arc::clone(runner);
     let tx = tx.clone();
     tokio::spawn(async move {
-        let result = async {
-            runner
-                .run(&panes::activate_tab_spec(&target.socket, target.tab_id))
-                .await?;
-            runner
-                .run(&panes::activate_pane_spec(&target.socket, target.pane_id))
-                .await
-        }
-        .await;
-        if let Err(e) = result {
+        if let Err(e) = cmux::focus(runner.as_ref(), &target.surface_id).await {
             let _ = tx.send(Msg::Error(format!("jump: {e}"))).await;
         }
     });

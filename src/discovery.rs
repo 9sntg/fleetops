@@ -100,13 +100,11 @@ struct RawSessionFile {
 pub struct LiveSession {
     /// Parsed session file.
     pub file: SessionFile,
-    /// `CLAUDE_ACCOUNT` from the process environment, if readable.
-    /// Always `None` since wave 11 — it lived in `/proc/<pid>/environ`; the macOS equivalent
-    /// arrives in wave 12, folded into the one `ps -Eww` call the identity lane needs.
+    /// `CLAUDE_ACCOUNT` from the process environment, if set.
     pub account: Option<String>,
-    /// `WEZTERM_PANE` from the process environment — exact pane identity.
-    /// Always `None` since wave 11; wave 12 replaces it with the cmux surface id.
-    pub wezterm_pane: Option<u64>,
+    /// `CMUX_SURFACE_ID` from the process environment — the exact cmux surface this session runs
+    /// in, and the jump target. `None` when the session isn't running under cmux (spec 012).
+    pub surface_id: Option<String>,
     /// The session's controlling terminal (`/dev/ttys000`), from the process table.
     /// The highlight write target.
     pub pts: Option<String>,
@@ -158,37 +156,6 @@ pub fn starttime_from_stat(stat: &str) -> Option<&str> {
     after_comm.split_ascii_whitespace().nth(19)
 }
 
-/// Facts read from `/proc/<pid>/environ` (NUL-separated bytes) in one pass.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct EnvironFacts {
-    /// `CLAUDE_ACCOUNT` — account attribution.
-    pub account: Option<String>,
-    /// `WEZTERM_PANE` — exact pane identity; non-numeric values ignored.
-    pub wezterm_pane: Option<u64>,
-}
-
-/// Extract the fields fleetops needs from Linux `/proc/<pid>/environ` bytes.
-///
-/// Linux legacy: the Claude lane stopped using this in wave 11; it survives only because
-/// `codex.rs` still walks `/proc`. Wave 14 deletes both together.
-///
-/// The allowlist is load-bearing and must stay one: a session's environment carries secrets
-/// (under cmux, `CMUX_SOCKET_CAPABILITY`), and fleetops never captures or logs them.
-pub fn parse_environ(environ: &[u8]) -> EnvironFacts {
-    let mut facts = EnvironFacts::default();
-    for entry in environ
-        .split(|&b| b == 0)
-        .filter_map(|e| std::str::from_utf8(e).ok())
-    {
-        if let Some(v) = entry.strip_prefix("CLAUDE_ACCOUNT=") {
-            facts.account = Some(v.to_string());
-        } else if let Some(v) = entry.strip_prefix("WEZTERM_PANE=") {
-            facts.wezterm_pane = v.parse().ok();
-        }
-    }
-    facts
-}
-
 /// Scan `sessions_dir` and filter by liveness against the `ps` process table. Blocking fs work —
 /// the sensor calls this inside `spawn_blocking`, having fetched `procs` off the blocking task.
 pub fn scan(sessions_dir: &Path, procs: &ProcTable) -> (Vec<LiveSession>, ScanStats) {
@@ -217,9 +184,8 @@ pub fn scan(sessions_dir: &Path, procs: &ProcTable) -> (Vec<LiveSession>, ScanSt
         };
         live.push(LiveSession {
             file,
-            // account + pane identity land in wave 12 (one `ps -Eww` for both).
-            account: None,
-            wezterm_pane: None,
+            account: facts.account.clone(),
+            surface_id: facts.surface_id.clone(),
             pts: facts.tty.clone(),
         });
     }
@@ -290,21 +256,6 @@ mod tests {
         assert_eq!(starttime_from_stat("no parens here"), None);
     }
 
-    #[test]
-    fn parse_environ_extracts_account_and_pane() {
-        let environ =
-            b"PATH=/usr/bin\0CLAUDE_ACCOUNT=alpha\0WEZTERM_PANE=26\0CLAUDE_CONFIG_DIR=/x\0";
-        let facts = parse_environ(environ);
-        assert_eq!(facts.account.as_deref(), Some("alpha"));
-        assert_eq!(facts.wezterm_pane, Some(26));
-
-        assert_eq!(parse_environ(b"PATH=/usr/bin\0"), EnvironFacts::default());
-        // non-numeric pane id ignored, account still extracted
-        let weird = parse_environ(b"WEZTERM_PANE=abc\0CLAUDE_ACCOUNT=bravo\0");
-        assert_eq!(weird.wezterm_pane, None);
-        assert_eq!(weird.account.as_deref(), Some("bravo"));
-    }
-
     /// Build a canned process table row — the `ps` output the sensor would have fetched.
     fn proc_row(table: &mut ProcTable, pid: u32, lstart: &str, tty: Option<&str>) {
         table.insert(
@@ -312,6 +263,8 @@ mod tests {
             ProcFacts {
                 lstart: normalize_lstart(lstart),
                 tty: tty.map(str::to_string),
+                surface_id: None,
+                account: None,
             },
         );
     }

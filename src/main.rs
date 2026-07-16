@@ -14,6 +14,7 @@
 //! - `unsafe_code = "forbid"` is crate policy (Cargo `[lints]`).
 
 mod board;
+mod cmux;
 mod codex;
 mod collect;
 mod discovery;
@@ -21,7 +22,6 @@ mod doctor;
 mod error;
 mod fold;
 mod highlight;
-mod panes;
 mod paths;
 mod procsrc;
 mod runner;

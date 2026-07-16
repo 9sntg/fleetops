@@ -16,3 +16,4 @@ Waves are defined by the architecture dossier in `plans/001-*`.
 | 9 | [009-wave9-snapshot-tab-index](009-wave9-snapshot-tab-index.md) | 🚧 Draft |
 | 10 | [010-wave10-agent-number-age](010-wave10-agent-number-age.md) | 🚧 Draft |
 | 11 | [011-wave11-macos-process-source](011-wave11-macos-process-source.md) | 🚧 Draft |
+| 12/13 | [012-wave12-cmux-lane](012-wave12-cmux-lane.md) | 🚧 Draft |

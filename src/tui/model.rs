@@ -275,11 +275,13 @@ impl App {
                             }
                         }
                     }
-                    None if row.pane_ambiguous => {
-                        self.error = Some(format!("jump: several panes match '{}'", row.name));
-                    }
+                    // No surface id, or its surface has closed since the sweep. With exact-id
+                    // matching there is no "several matched" case left to report (spec 012).
                     None => {
-                        self.error = Some(format!("jump: no pane matched '{}'", row.name));
+                        self.error = Some(format!(
+                            "jump: '{}' isn't in a cmux surface — not started under cmux?",
+                            row.name
+                        ));
                     }
                 }
             }
@@ -307,17 +309,11 @@ mod tests {
     use crate::highlight::{HighlightCmd, Tint};
 
     /// Existing rows: default status `Working`, no pts (pre-wave-6 shape preserved).
-    fn row(id: &str, pane: Option<(u64, u64)>, ambiguous: bool) -> SessionRow {
-        row_full(id, pane, ambiguous, Status::Working, None)
+    fn row(id: &str, surface: Option<&str>) -> SessionRow {
+        row_full(id, surface, Status::Working, None)
     }
 
-    fn row_full(
-        id: &str,
-        pane: Option<(u64, u64)>,
-        ambiguous: bool,
-        status: Status,
-        pts: Option<&str>,
-    ) -> SessionRow {
+    fn row_full(id: &str, surface: Option<&str>, status: Status, pts: Option<&str>) -> SessionRow {
         SessionRow {
             session_id: id.to_string(),
             name: format!("session {id}"),
@@ -327,13 +323,11 @@ mod tests {
             context_tokens: Some(50_000),
             ctx_pct: None,
             secs_since_append: Some(3),
-            pane: pane.map(|(tab_id, pane_id)| MatchedPane {
-                socket: String::new(),
-                tab_id,
-                pane_id,
+            pane: surface.map(|id| MatchedPane {
+                surface_id: id.to_string(),
+                window_index: 1,
                 tab_index: 1,
             }),
-            pane_ambiguous: ambiguous,
             pts: pts.map(str::to_string),
         }
     }
@@ -348,7 +342,7 @@ mod tests {
     fn app_with(ids: &[&str]) -> App {
         let mut app = App::default();
         app.update(snapshot(
-            ids.iter().map(|id| row(id, Some((1, 9)), false)).collect(),
+            ids.iter().map(|id| row(id, Some("uuid-9"))).collect(),
         ));
         app
     }
@@ -376,9 +370,9 @@ mod tests {
         app.update(Msg::Key(Action::Down)); // select b
                                             // Rows resort: b moves to index 2.
         app.update(snapshot(vec![
-            row("c", None, false),
-            row("a", None, false),
-            row("b", None, false),
+            row("c", None),
+            row("a", None),
+            row("b", None),
         ]));
         assert_eq!(app.selected.as_deref(), Some("b"));
         assert_eq!(app.selected_index(), Some(2));
@@ -389,7 +383,7 @@ mod tests {
         let mut app = app_with(&["a", "b", "c"]);
         app.update(Msg::Key(Action::Down));
         app.update(Msg::Key(Action::Down)); // select c (index 2)
-        app.update(snapshot(vec![row("a", None, false), row("b", None, false)]));
+        app.update(snapshot(vec![row("a", None), row("b", None)]));
         assert_eq!(
             app.selected.as_deref(),
             Some("b"),
@@ -411,30 +405,26 @@ mod tests {
         let mut app = app_with(&["a"]);
         app.update(Msg::Key(Action::Jump));
         assert_eq!(
-            app.pending_jump.as_ref().map(|p| (p.tab_id, p.pane_id)),
-            Some((1, 9)),
+            app.pending_jump.as_ref().map(|p| p.surface_id.clone()),
+            Some("uuid-9".to_string()),
             "tab id needed to bring the tab forward"
         );
     }
 
     #[test]
-    fn jump_without_pane_match_reports_not_crashes() {
+    fn jump_without_a_surface_reports_not_crashes() {
+        // `pane: None` means either "not started under cmux" or "its surface closed since the
+        // sweep". Both are the same non-event here: report, never dispatch, never panic.
+        // (Wave 12 dropped this test's second half — the wezterm-era "several panes match"
+        // ambiguity case — because exact id matching cannot produce it.)
         let mut app = App::default();
-        app.update(snapshot(vec![row("a", None, false)]));
+        app.update(snapshot(vec![row("a", None)]));
         app.update(Msg::Key(Action::Jump));
         assert_eq!(app.pending_jump, None);
         assert!(app
             .error
             .as_deref()
-            .is_some_and(|e| e.contains("no pane matched")));
-
-        let mut app = App::default();
-        app.update(snapshot(vec![row("a", None, true)]));
-        app.update(Msg::Key(Action::Jump));
-        assert!(app
-            .error
-            .as_deref()
-            .is_some_and(|e| e.contains("several panes")));
+            .is_some_and(|e| e.contains("isn't in a cmux surface")));
     }
 
     #[test]
@@ -442,12 +432,12 @@ mod tests {
         let mut app = app_with(&["a"]);
         app.update(Msg::Tick);
         app.update(Msg::Error("boom".into()));
-        app.update(snapshot(vec![row("a", None, false)]));
+        app.update(snapshot(vec![row("a", None)]));
         assert_eq!(app.refresh_age_secs, 0);
         assert_eq!(app.error, None);
 
         app.update(Msg::Snapshot(Box::new(Snapshot {
-            rows: vec![row("a", None, false)],
+            rows: vec![row("a", None)],
             lane_error: Some("wezterm.exe: timed out after 5s".to_string()),
             ..Snapshot::default()
         })));
@@ -462,7 +452,7 @@ mod tests {
         let mut app = App::default();
         app.update(Msg::Snapshot(Box::new(Snapshot {
             seq: 2,
-            rows: vec![row("fresh", Some((1, 9)), false)],
+            rows: vec![row("fresh", Some("uuid-9"))],
             ..Snapshot::default()
         })));
         // An older sweep (seq 1) finishes late — with stale rows and a stale lane error.
@@ -505,7 +495,6 @@ mod tests {
         app.update(snapshot(vec![row_full(
             "a",
             None,
-            false,
             Status::Working,
             Some("/dev/pts/3"),
         )]));
@@ -513,7 +502,6 @@ mod tests {
         app.update(snapshot(vec![row_full(
             "a",
             None,
-            false,
             Status::Idle,
             Some("/dev/pts/3"),
         )]));
@@ -529,15 +517,7 @@ mod tests {
     #[test]
     fn needs_answer_emits_amber_steady_once_not_every_sweep() {
         let mut app = App::default();
-        let make = || {
-            vec![row_full(
-                "a",
-                None,
-                false,
-                Status::NeedsAnswer,
-                Some("/dev/pts/4"),
-            )]
-        };
+        let make = || vec![row_full("a", None, Status::NeedsAnswer, Some("/dev/pts/4"))];
         app.update(snapshot(make()));
         assert_eq!(
             app.pending_highlights,
@@ -561,7 +541,6 @@ mod tests {
         app.update(snapshot(vec![row_full(
             "a",
             None,
-            false,
             Status::Working,
             Some("/dev/pts/5"),
         )]));
@@ -569,7 +548,6 @@ mod tests {
         app.update(snapshot(vec![row_full(
             "a",
             None,
-            false,
             Status::Idle,
             Some("/dev/pts/5"),
         )])); // finish -> pulse settling into sticky green
@@ -577,7 +555,6 @@ mod tests {
         app.update(snapshot(vec![row_full(
             "a",
             None,
-            false,
             Status::Idle,
             Some("/dev/pts/5"),
         )])); // still idle, still green
@@ -593,7 +570,6 @@ mod tests {
         app.update(snapshot(vec![row_full(
             "a",
             None,
-            false,
             Status::Working,
             Some("/dev/pts/6"),
         )]));
@@ -601,7 +577,6 @@ mod tests {
         app.update(snapshot(vec![row_full(
             "a",
             None,
-            false,
             Status::Idle,
             Some("/dev/pts/6"),
         )])); // finish -> green
@@ -609,7 +584,6 @@ mod tests {
         app.update(snapshot(vec![row_full(
             "a",
             None,
-            false,
             Status::Working,
             Some("/dev/pts/6"),
         )])); // prompted again — Idle is left
@@ -628,16 +602,14 @@ mod tests {
         let mut app = App::default();
         app.update(snapshot(vec![row_full(
             "g",
-            Some((1, 9)),
-            false,
+            Some("uuid-9"),
             Status::Working,
             Some("/dev/pts/7"),
         )]));
         app.pending_highlights.clear();
         app.update(snapshot(vec![row_full(
             "g",
-            Some((1, 9)),
-            false,
+            Some("uuid-9"),
             Status::Idle,
             Some("/dev/pts/7"),
         )])); // finish -> green
@@ -655,8 +627,7 @@ mod tests {
         let mut app = App::default();
         app.update(snapshot(vec![row_full(
             "a",
-            Some((1, 9)),
-            false,
+            Some("uuid-9"),
             Status::NeedsAnswer,
             Some("/dev/pts/8"),
         )]));
@@ -674,7 +645,6 @@ mod tests {
         app.update(snapshot(vec![row_full(
             "g",
             None,
-            false,
             Status::Working,
             Some("/dev/pts/7"),
         )]));
@@ -682,10 +652,9 @@ mod tests {
         app.update(snapshot(vec![row_full(
             "g",
             None,
-            false,
             Status::Idle,
-            Some("/dev/pts/7"),
-        )])); // finish -> green, but pane: None so the jump below fails
+            Some("/dev/ttys007"),
+        )])); // finish -> green, but no surface so the jump below fails
         app.pending_highlights.clear();
         app.update(Msg::Key(Action::Jump));
         assert!(
@@ -695,7 +664,7 @@ mod tests {
         assert!(
             app.error
                 .as_deref()
-                .is_some_and(|e| e.contains("no pane matched")),
+                .is_some_and(|e| e.contains("isn't in a cmux surface")),
             "jump failure still reported"
         );
     }
@@ -707,7 +676,6 @@ mod tests {
         app.update(snapshot(vec![row_full(
             "old",
             None,
-            false,
             Status::NeedsAnswer,
             Some("/dev/pts/12"),
         )]));
@@ -717,7 +685,6 @@ mod tests {
         app.update(snapshot(vec![row_full(
             "new",
             None,
-            false,
             Status::Stalled,
             Some("/dev/pts/12"),
         )]));
@@ -737,7 +704,6 @@ mod tests {
         app.update(snapshot(vec![row_full(
             "a",
             None,
-            false,
             Status::NeedsAnswer,
             Some("/dev/pts/9"),
         )]));
@@ -759,7 +725,6 @@ mod tests {
         app.update(snapshot(vec![row_full(
             "a",
             None,
-            false,
             Status::Working,
             Some("/dev/pts/10"),
         )]));
@@ -775,7 +740,6 @@ mod tests {
         app.update(snapshot(vec![row_full(
             "a",
             None,
-            false,
             Status::Working,
             Some("/dev/pts/10"),
         )])); // identical second sweep
@@ -791,7 +755,6 @@ mod tests {
         app.update(snapshot(vec![row_full(
             "a",
             None,
-            false,
             Status::NeedsAnswer,
             None,
         )]));
@@ -806,13 +769,7 @@ mod tests {
         let mut app = App::default();
         app.update(Msg::Snapshot(Box::new(Snapshot {
             seq: 2,
-            rows: vec![row_full(
-                "a",
-                None,
-                false,
-                Status::Working,
-                Some("/dev/pts/11"),
-            )],
+            rows: vec![row_full("a", None, Status::Working, Some("/dev/pts/11"))],
             ..Snapshot::default()
         })));
         app.pending_highlights.clear();
@@ -821,7 +778,6 @@ mod tests {
             rows: vec![row_full(
                 "a",
                 None,
-                false,
                 Status::NeedsAnswer,
                 Some("/dev/pts/11"),
             )],

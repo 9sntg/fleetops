@@ -16,9 +16,9 @@ warnings). If a new lint allow is genuinely warranted, justify it inline next to
 
 ## Working style
 
-- This is a **WSL2/Linux** tool. Session discovery needs `/proc`; the pane lane shells out to the
-  Windows `wezterm.exe`. Keep core logic pure and testable off the OS/network (see the
-  `#[cfg(test)]` tables throughout `src/`).
+- This is a **macOS + cmux** tool. Session discovery shells out to `ps`; the pane/jump lane uses
+  cmux's AppleScript interface via `osascript`. Both go through the `Runner` seam, so keep core
+  logic pure and testable off the OS/network (see the `#[cfg(test)]` tables throughout `src/`).
 - Development is spec-driven: specs live in `specs/` (index: `specs/README.md`), coding rules in
   `rules/` (start at `rules/_index.md`). Every source file carries a `//!` module header
   (`rules/file-headers.md`).

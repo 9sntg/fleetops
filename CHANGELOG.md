@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+- **The cmux lane replaces wezterm — pane identity is now exact (spec 012, waves 12–13)** — cmux
+  exports `CMUX_SURFACE_ID` into every terminal it starts, and spec 011's single `ps` call already
+  reads process environments, so a session's surface comes free with its liveness. Topology and
+  the jump use cmux's shipped **AppleScript** interface (`cmux.sdef`), not its control socket:
+  the socket's default `automation.socketControlMode = cmuxOnly` would force `fleet` to run
+  inside cmux or to handle `CMUX_SOCKET_CAPABILITY` — a credential fleetops must never touch.
+  AppleScript needs none and works inside or outside cmux.
+  - **Matching is exact or absent.** A surface id names exactly one surface (UUIDs), so the
+    title/cwd tie-break tiers, the `ambiguous` outcome and the `≈?` PANE marker are **deleted** —
+    there is nothing left to guess. A session started outside cmux simply shows `—`.
+  - **Jump is one call.** `focus <terminal>` raises the window AND focuses the surface, so
+    wezterm's ordered `activate-tab` → `activate-pane` hazard is structurally gone.
+  - **Injection-proof:** the surface id rides as `osascript` argv, never interpolated into the
+    script. Verified live — a `do shell script` payload returns `notfound` rather than executing.
+  - Removed: `src/panes.rs` (1047 lines), `tests/fixtures/wezterm-list.json`, `tasklist.exe`,
+    `wezterm.exe`, `WSLENV` forwarding, the `/mnt/c/Users/*` socket-glob ladder, multi-instance
+    partial-failure merging, and `AppError::Parse`.
+  - `fleet snapshot` contract change: `focused_pane_id` → `focused_surface_id` (string),
+    `pane_id` → `surface_id` (string); `tab_index` is now the 1-based cmux tab.
+
+- **Fixed: the pane-highlight used Linux fcntl flags on macOS (wave 13)** — `O_NOCTTY`/`O_NONBLOCK`
+  were hardcoded to Linux's asm-generic values (`0o400`/`0o4000`), which on Darwin mean
+  `O_NOFOLLOW` and `O_EXCL`. Since `O_EXCL` without `O_CREAT` is ignored, the pty opened
+  **without non-blocking semantics** — a write to a wedged pty could block — and it could never
+  fail loudly because the writer drops every error by design. Now Darwin's `0x20000`/`0x4`, pinned
+  by a test and re-verified against a real pty.
+
 - **macOS process source — the board works on macOS (spec 011, wave 11)** — session liveness no
   longer needs Linux `/proc`, so the fleet is visible on a Mac. macOS Claude Code records
   `procStart` as a UTC wall-clock string (`"Thu Jul 16 19:10:07 2026"`) rather than Linux clock

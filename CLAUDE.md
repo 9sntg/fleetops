@@ -3,20 +3,31 @@
 Fleetops is a single-binary Rust TUI that monitors **all running Claude Code sessions** on this
 machine — the fleet. Per session it shows a **semantic name** (what the session is working on),
 **status** (working / done / needs input / question), **tokens spent**, **context % remaining**
-(same numbers as the status bar), and the wezterm pane it lives in (jump-to-pane). Sessions run
-across one wezterm window with many tabs/panes; fleetops renders the overview on the TUI monitor.
-Built for WSL2. Sibling of `/tui/tokenomics` (accounts/limits) — fleetops is per-**session**,
+(same numbers as the status bar), and the cmux surface it lives in (jump-to-surface). Sessions run
+across cmux windows/tabs; fleetops renders the overview on the TUI monitor.
+Built for macOS + cmux (waves 11-13 ported it off WSL2/wezterm). Sibling of `/tui/tokenomics` (accounts/limits) — fleetops is per-**session**,
 tokenomics is per-**account**.
 
 ## Status
 
-**Waves 1–4 shipped** (specs 001–004) — full Option A "sensor fusion" per the dossier in
-`plans/001-*`: session discovery (`~/.claude/sessions/*.json` + /proc liveness + account
-attribution), transcript-tail telemetry (ctx%/tokens/ai-title/pending question), pure status
-fold (NeedsAnswer / Waiting / Stalled? / Unknown / Working / Idle / Shell), title-first pane
-matching + jump, `fleet doctor` drift report. Verified data sources + implementation
-corrections: `docs/RESEARCH.md`. Next (trigger-gated, see dossier): hook lane, SQLite history,
-WSLENV pane forwarding.
+**Waves 1–10 shipped** on WSL2/wezterm (specs 001–010): session discovery, transcript-tail
+telemetry (ctx%/tokens/ai-title/pending question), pure status fold (NeedsAnswer / Waiting /
+Stalled? / Unknown / Working / Idle / Shell), pane matching + jump, `fleet doctor`, `fleet
+snapshot`, the Codex lane. Verified data sources + implementation corrections: `docs/RESEARCH.md`.
+
+**Waves 11–13 (specs 011–012) ported the whole thing to macOS + cmux** and deleted the Linux/WSL
+sources rather than cfg-gating them:
+- Liveness: one `TZ=UTC ps -AEwwo pid=,tty=,lstart=,command=` call replaces `/proc`. macOS Claude
+  Code writes `procStart` as a UTC wall-clock string; `ps` reproduces it byte-for-byte, so the
+  PID-reuse guard stays a string equality over an opaque token.
+- Identity: `CMUX_SURFACE_ID` (from that same call's environ, allowlisted) → exact surface match.
+  No title/cwd tie-breaks, no `ambiguous` outcome.
+- Panes/jump: cmux's AppleScript API (`src/cmux.rs`), NOT its control socket — the socket is
+  `cmuxOnly`-gated and would require handling `CMUX_SOCKET_CAPABILITY`, a credential.
+- `src/panes.rs` (wezterm/WSL) is deleted.
+
+**Next:** wave 14 — port the Codex lane (`codex.rs` still walks `/proc`, so it returns empty
+here; it needs `ps` + an `lsof` cwd join). Unverifiable until Codex CLI is installed.
 
 ## Tech Stack
 
@@ -24,6 +35,7 @@ WSLENV pane forwarding.
 |-------|-----------|
 | Language | Rust (2021, strict — `forbid(unsafe_code)`, clippy pedantic `-D warnings`) |
 | TUI | ratatui + crossterm |
+| Platform | macOS only; `ps` for the process table, cmux's AppleScript API for panes/jump |
 | Async | tokio (never block the UI task; results arrive as messages over channels) |
 
 ## Commands
@@ -31,7 +43,7 @@ WSLENV pane forwarding.
 ```bash
 ./check.sh              # THE GATE: fmt --check + clippy -D warnings + test (must be green)
 fleet                   # launch the board (~/.local/bin/fleet -> target/release/fleet)
-fleet doctor            # read-only drift report (sessions/transcripts/panes/wezterm)
+fleet doctor            # read-only drift report (sessions/transcripts/surfaces/cmux)
 cargo run               # dev build of the board
 cargo build --release   # refresh the installed binary (the symlink tracks it)
 ```

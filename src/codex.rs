@@ -4,8 +4,8 @@
 //! Project: Fleetops — TUI monitoring all running Claude Code sessions (the fleet)
 //! Module:  src/codex.rs
 //! Deps:    serde/serde_json (rollout JSON); std::fs (via `scan`, called by the sensor's
-//!          spawn_blocking); board (SessionRow, match_pane); discovery (parse_environ,
-//!          starttime_from_stat); fold (Status, STALL_AFTER_SECS); panes (PaneRow)
+//!          spawn_blocking); board (SessionRow, match_surface); discovery
+//!          (starttime_from_stat); fold (Status, STALL_AFTER_SECS); cmux (Surface)
 //! Tested:  inline `#[cfg(test)]` — synthetic rollout JSONL lines + tempdir fake `/proc` +
 //!          `~/.codex/sessions` tree (house pattern, see discovery.rs/telemetry.rs)
 //!
@@ -20,7 +20,7 @@
 //!   processes sharing a cwd never join (`join_rollouts` — never guess, house rule).
 //! - `scan`: the one fs-touching entry point, mirroring `discovery::scan`'s shape — walks
 //!   `proc_root` for live Codex TUIs and `codex_root/sessions/**/rollout-*.jsonl` for
-//!   candidates, joins them, and assembles `SessionRow`s (pane matched via `board::match_pane`).
+//!   candidates, joins them, and assembles `SessionRow`s (matched via `board::match_surface`).
 //!
 //! Design constraints:
 //! - Read-only over `~/.codex`; never writes.
@@ -38,9 +38,9 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::board::{self, SessionRow};
+use crate::cmux::Surface;
 use crate::discovery;
 use crate::fold::{self, Status};
-use crate::panes::PaneRow;
 
 /// `session_meta` line 0 of a rollout — tolerant, unknown fields skipped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,15 +263,15 @@ struct ProcInfo {
     pid: u32,
     cwd: String,
     pts: Option<String>,
-    wezterm_pane: Option<u64>,
+    surface_id: Option<String>,
     start_wallclock_secs: u64,
 }
 
 /// Scan `codex_root` for rollouts and `proc_root` for live Codex TUI processes, join them, and
-/// return assembled `SessionRow`s — matched against `panes` via the existing `board::match_pane`
+/// return assembled `SessionRow`s — matched against `surfaces` via `board::match_surface`
 /// (env pane id only). Blocking fs work — the sensor calls this inside `spawn_blocking`, same
 /// pattern as `discovery::scan`.
-pub fn scan(codex_root: &Path, proc_root: &Path, panes: &[PaneRow]) -> Vec<SessionRow> {
+pub fn scan(codex_root: &Path, proc_root: &Path, surfaces: &[Surface]) -> Vec<SessionRow> {
     let proc_infos = scan_procs(proc_root);
     let (candidates, paths_by_id) = scan_rollouts(codex_root);
     let join_procs: Vec<CodexProc> = proc_infos
@@ -292,7 +292,7 @@ pub fn scan(codex_root: &Path, proc_root: &Path, panes: &[PaneRow]) -> Vec<Sessi
         .zip(joined)
         .map(|(proc, matched)| {
             let shares_cwd = proc_infos.iter().filter(|p| p.cwd == proc.cwd).count() > 1;
-            build_row(now_secs, proc, matched, &paths_by_id, shares_cwd, panes)
+            build_row(now_secs, proc, matched, &paths_by_id, shares_cwd, surfaces)
         })
         .collect()
 }
@@ -344,15 +344,11 @@ fn read_proc_info(proc_root: &Path, pid: u32, btime: u64) -> Option<ProcInfo> {
     let starttime_ticks: u64 = discovery::starttime_from_stat(&stat)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let environ = std::fs::read(dir.join("environ"))
-        .ok()
-        .map(|b| discovery::parse_environ(&b))
-        .unwrap_or_default();
     Some(ProcInfo {
         pid,
         cwd,
         pts: fd1_target,
-        wezterm_pane: environ.wezterm_pane,
+        surface_id: None, // wave 14: the macOS codex lane reads CMUX_SURFACE_ID from procsrc
         start_wallclock_secs: btime + starttime_ticks / HZ,
     })
 }
@@ -460,12 +456,12 @@ fn build_row(
     matched: Option<&RolloutCandidate>,
     paths_by_id: &HashMap<String, PathBuf>,
     shares_cwd: bool,
-    panes: &[PaneRow],
+    surfaces: &[Surface],
 ) -> SessionRow {
-    let (pane, pane_ambiguous) = board::match_pane(proc.wezterm_pane, &proc.cwd, &[], panes);
+    let pane = board::match_surface(proc.surface_id.as_deref(), surfaces);
     // The highlight write-target guard, same as the Claude lane (wave 6, spec 006): a process is
     // only ever highlightable when it renders in a wezterm pane.
-    let pts = if proc.wezterm_pane.is_some() {
+    let pts = if proc.surface_id.is_some() {
         proc.pts.clone()
     } else {
         None
@@ -487,7 +483,6 @@ fn build_row(
             ctx_pct: None,
             secs_since_append: None,
             pane,
-            pane_ambiguous,
             pts,
         };
     };
@@ -512,7 +507,6 @@ fn build_row(
         ctx_pct: facts.ctx_pct,
         secs_since_append: age_secs,
         pane,
-        pane_ambiguous,
         pts,
     }
 }
@@ -521,7 +515,6 @@ fn build_row(
 mod tests {
     use super::*;
     use crate::fold::STALL_AFTER_SECS;
-    use crate::panes::PaneStatus;
 
     // --- is_codex_tui ---
 
@@ -810,28 +803,20 @@ mod tests {
             real_cwd.to_str().unwrap(),
             &[event_line("task_complete")],
         );
-        let panes = [PaneRow {
-            socket: String::new(),
-            pane_id: 27,
-            tab_id: 3,
-            tab_index: 2,
-            status: PaneStatus::Working,
-            name: String::new(),
-            cwd: String::new(),
-            is_active: false,
-        }];
-
-        let rows = scan(&codex_root, &proc_root, &panes);
+        let rows = scan(&codex_root, &proc_root, &[]);
         std::fs::remove_dir_all(&tmp).ok();
 
         assert_eq!(rows.len(), 1, "one codex TUI process, one row");
         let row = &rows[0];
         assert_eq!(row.account.as_deref(), Some("codex"));
-        assert_eq!(row.pts.as_deref(), Some("/dev/pts/8"));
         assert_eq!(
-            row.pane.as_ref().map(|p| p.pane_id),
-            Some(27),
-            "matched via WEZTERM_PANE=27"
+            row.pane, None,
+            "wave 12: the Codex lane carries no CMUX_SURFACE_ID yet, so it never matches a \
+             surface. Wave 14 sources it from procsrc like the Claude lane."
+        );
+        assert_eq!(
+            row.pts, None,
+            "and with no surface the highlight write-target guard withholds the pts"
         );
         assert_eq!(row.status, Status::Idle, "task_complete tail");
         assert_eq!(

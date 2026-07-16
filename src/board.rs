@@ -2,22 +2,25 @@
 //!
 //! Project: Fleetops — TUI monitoring all running Claude Code sessions (the fleet)
 //! Module:  src/board.rs
-//! Deps:    discovery, telemetry, fold, panes (types only)
-//! Tested:  inline `#[cfg(test)]` — pane match table, assembly ordering, name preference,
-//!          pts flowing to the row only when a pane matched
+//! Deps:    discovery, telemetry, fold, cmux (types only)
+//! Tested:  inline `#[cfg(test)]` — surface match table, assembly ordering, name preference,
+//!          pts flowing to the row only when a surface matched
 //!
 //! Key responsibilities:
-//! - `match_pane`: session (cwd, name) → wezterm pane, tie-broken by title, ambiguity surfaced.
+//! - `match_surface`: session → its cmux surface, by exact id.
 //! - `assemble`: fold each session's status, prefer ai-title over the derived name, sort by
 //!   attention bucket then name.
 //!
 //! Design constraints:
 //! - Pure — the sensor task calls this with data already in hand; no I/O, no clocks.
-//! - Ambiguous pane matches are marked, never guessed silently (dossier pre-mortem #4).
+//! - The match is EXACT or absent: a session's `CMUX_SURFACE_ID` names one surface, and surface
+//!   ids are unique UUIDs. Wave 12 retired wezterm's title/cwd tie-break tiers and with them the
+//!   `ambiguous` outcome — with exact identity there is nothing left to guess (dossier
+//!   pre-mortem #4 is satisfied by construction rather than by flagging).
 
+use crate::cmux::Surface;
 use crate::discovery::LiveSession;
 use crate::fold::{self, Status};
-use crate::panes::PaneRow;
 use crate::telemetry::{self, Telemetry};
 
 /// One board row — a live session with everything the view renders.
@@ -40,87 +43,55 @@ pub struct SessionRow {
     pub ctx_pct: Option<u8>,
     /// Seconds since the transcript last grew.
     pub secs_since_append: Option<u64>,
-    /// Matched wezterm pane — the jump target.
+    /// Matched cmux surface — the jump target.
     pub pane: Option<MatchedPane>,
-    /// More than one pane matched and the title tie-break failed.
-    pub pane_ambiguous: bool,
-    /// The session's pts, carried through only when `wezterm_pane` is present — the
+    /// The session's pts, carried through only when it renders in a cmux surface — the
     /// highlight write-target guard lives here, not in the writer (wave 6, spec 006).
     pub pts: Option<String>,
 }
 
-/// The pane a session resolved to: instance + ids for the jump, tab position for the board.
+/// The cmux surface a session resolved to: the id for the jump, tab position for the board.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchedPane {
-    /// Windows-form socket of the owning wezterm instance ("" = invoker's own).
-    pub socket: String,
-    /// wezterm tab id (jump: activate-tab).
-    pub tab_id: u64,
-    /// wezterm pane id (jump: activate-pane).
-    pub pane_id: u64,
-    /// 0-based tab index — matches `wezterm cli activate-tab --tab-index` (spec 009); emitted
-    /// as-is by the `fleet snapshot` `tab_index` field for automation. The board itself no longer
-    /// displays a tab number (spec 010 replaced the TAB column with the `#` agent-number column).
-    pub tab_index: u64,
+    /// The surface UUID — the jump target (`cmux::focus`).
+    pub surface_id: String,
+    /// 1-based window position.
+    pub window_index: u32,
+    /// 1-based tab (workspace) position within its window; emitted by `fleet snapshot` for
+    /// automation and rendered in the board's PANE column.
+    pub tab_index: u32,
 }
 
 impl MatchedPane {
-    fn from_pane(p: &PaneRow) -> Self {
+    fn from_surface(s: &Surface) -> Self {
         Self {
-            socket: p.socket.clone(),
-            tab_id: p.tab_id,
-            pane_id: p.pane_id,
-            tab_index: p.tab_index,
+            surface_id: s.id.clone(),
+            window_index: s.window_index,
+            tab_index: s.tab_index,
         }
     }
 }
 
-/// Match a session to a wezterm pane. Priority (spec 005):
-/// 1. exact — the session's own `WEZTERM_PANE` (WSLENV-forwarded), if that pane still exists
-///    and its id is unique across instances (a cross-instance collision falls through);
-/// 2. title (verified live: WSL panes report the Windows cwd `file:///C:/Users/user/` — OSC7
-///    cwd never crosses from WSL, only titles do);
-/// 3. cwd, for the rare pane whose cwd did cross. Returns `(pane, ambiguous)`.
-pub fn match_pane(
-    env_pane: Option<u64>,
-    cwd: &str,
-    names: &[&str],
-    panes: &[PaneRow],
-) -> (Option<MatchedPane>, bool) {
-    // Pane ids are only unique WITHIN a wezterm instance (panes.rs) — a cross-instance id
-    // collision must fall through to the tie-breaks below, never guess by list order.
-    let mut env_collision = false;
-    if let Some(id) = env_pane {
-        let hits: Vec<&PaneRow> = panes.iter().filter(|p| p.pane_id == id).collect();
-        match hits.as_slice() {
-            [only] => return (Some(MatchedPane::from_pane(only)), false), // exact identity
-            [] => {} // env pane gone from the list (pane closed) — fall through
-            [_, ..] => env_collision = true,
-        }
-    }
-    let by_title: Vec<&PaneRow> = panes
+/// Match a session to its cmux surface by exact id (spec 012).
+///
+/// The session's own `CMUX_SURFACE_ID` (read from its environment) names exactly one surface,
+/// and surface ids are unique UUIDs — so this is identity, not inference. A session with no
+/// surface id isn't running under cmux; a surface id absent from the list means the surface
+/// closed since the sweep. Both are simply "no match", never a guess.
+pub fn match_surface(surface_id: Option<&str>, surfaces: &[Surface]) -> Option<MatchedPane> {
+    let wanted = surface_id?;
+    surfaces
         .iter()
-        .filter(|p| names.iter().any(|n| !n.is_empty() && p.name == *n))
-        .collect();
-    match by_title.as_slice() {
-        [only] => return (Some(MatchedPane::from_pane(only)), false),
-        [_, ..] => return (None, true),
-        [] => {}
-    }
-    let by_cwd: Vec<&PaneRow> = panes.iter().filter(|p| p.cwd == cwd).collect();
-    match by_cwd.as_slice() {
-        [] => (None, env_collision), // an unresolved env-id collision IS ambiguity
-        [only] => (Some(MatchedPane::from_pane(only)), false),
-        [_, ..] => (None, true),
-    }
+        .find(|s| s.id == wanted)
+        .map(MatchedPane::from_surface)
 }
 
-/// Join sessions with their telemetry (parallel slice, same order) and the pane list.
+/// Join sessions with their telemetry (parallel slice, same order) and the cmux surface list.
 /// Output is sorted: attention buckets first, then by name.
 pub fn assemble(
     sessions: &[LiveSession],
     telemetry: &[Telemetry],
-    panes: &[PaneRow],
+    surfaces: &[Surface],
 ) -> Vec<SessionRow> {
     let mut rows: Vec<SessionRow> = sessions
         .iter()
@@ -136,13 +107,7 @@ pub fn assemble(
                 .ai_title
                 .filter(|t| !t.is_empty())
                 .unwrap_or_else(|| session.file.name.clone());
-            // Try both the shown name and the native name — the pane title may carry either.
-            let (pane, pane_ambiguous) = match_pane(
-                session.wezterm_pane,
-                &session.file.cwd,
-                &[&name, &session.file.name],
-                panes,
-            );
+            let pane = match_surface(session.surface_id.as_deref(), surfaces);
             SessionRow {
                 session_id: session.file.session_id.clone(),
                 name,
@@ -155,10 +120,9 @@ pub fn assemble(
                     .map(|t| clamp_pct_u8(telemetry::ctx_used_pct(t))),
                 secs_since_append: tel.secs_since_append,
                 pane,
-                pane_ambiguous,
                 // The highlight write-target guard: a session is only ever highlightable when
-                // it renders in a wezterm pane (spec 006).
-                pts: if session.wezterm_pane.is_some() {
+                // it renders in a cmux surface (spec 006, retargeted in spec 012).
+                pts: if session.surface_id.is_some() {
                     session.pts.clone()
                 } else {
                     None
@@ -205,28 +169,22 @@ pub fn format_age(secs: u64) -> String {
 mod tests {
     use super::*;
     use crate::discovery::{NativeStatus, SessionFile};
-    use crate::panes::PaneStatus;
     use crate::telemetry::TailFacts;
 
-    fn pane(pane_id: u64, cwd: &str, name: &str) -> PaneRow {
-        PaneRow {
-            socket: "C:\\sock".to_string(),
-            pane_id,
-            tab_id: 1,
-            tab_index: 1,
-            status: PaneStatus::Working,
-            name: name.to_string(),
+    fn surface(id: &str, tab_index: u32, cwd: &str) -> Surface {
+        Surface {
+            id: id.to_string(),
+            window_index: 1,
+            tab_index,
             cwd: cwd.to_string(),
-            is_active: false,
         }
     }
 
-    fn matched(pane_id: u64) -> MatchedPane {
+    fn matched(id: &str, tab_index: u32) -> MatchedPane {
         MatchedPane {
-            socket: "C:\\sock".to_string(),
-            tab_id: 1,
-            pane_id,
-            tab_index: 1,
+            surface_id: id.to_string(),
+            window_index: 1,
+            tab_index,
         }
     }
 
@@ -243,8 +201,17 @@ mod tests {
                 version: None,
             },
             account: Some("alpha".to_string()),
-            wezterm_pane: None,
+            surface_id: None,
             pts: None,
+        }
+    }
+
+    /// A session running inside a cmux surface (i.e. one that CAN be jumped to).
+    fn session_in(id: &str, cwd: &str, name: &str, status: NativeStatus, sid: &str) -> LiveSession {
+        LiveSession {
+            surface_id: Some(sid.to_string()),
+            pts: Some("/dev/ttys003".to_string()),
+            ..session(id, cwd, name, status)
         }
     }
 
@@ -256,76 +223,47 @@ mod tests {
     }
 
     #[test]
-    fn match_pane_table() {
-        let panes = [
-            pane(1, "/a", "one"),
-            pane(2, "/b", "two"),
-            pane(3, "/b", "three"),
-            pane(4, "C:/Users/user", "dupe"),
-            pane(5, "C:/Users/user", "dupe"),
+    fn match_surface_table() {
+        let surfaces = [
+            surface("uuid-a", 1, "/a"),
+            surface("uuid-b", 2, "/b"),
+            surface("uuid-c", 3, "/b"), // same cwd as b — irrelevant to an id match
         ];
-        // exact env pane beats everything, even a duplicate title situation
+        // Exact identity.
         assert_eq!(
-            match_pane(Some(4), "/z", &["dupe"], &panes),
-            (Some(matched(4)), false)
+            match_surface(Some("uuid-b"), &surfaces),
+            Some(matched("uuid-b", 2))
         );
-        // env pane no longer in the list → falls through to title
-        assert_eq!(
-            match_pane(Some(99), "/z", &["three"], &panes),
-            (Some(matched(3)), false)
-        );
-        // title match is primary — cwd wrong (the WSL reality) but title unique
-        assert_eq!(
-            match_pane(None, "/z", &["three"], &panes),
-            (Some(matched(3)), false)
-        );
-        // second name (native) matches when the first (ai-title) doesn't
-        assert_eq!(
-            match_pane(None, "/z", &["no", "two"], &panes),
-            (Some(matched(2)), false)
-        );
-        // duplicate titles → ambiguous, never guessed
-        assert_eq!(match_pane(None, "/z", &["dupe"], &panes), (None, true));
-        // empty names never match empty-titled panes
-        assert_eq!(match_pane(None, "/z", &[""], &panes), (None, false));
-        // cwd fallback: unique
-        assert_eq!(
-            match_pane(None, "/a", &["nomatch"], &panes),
-            (Some(matched(1)), false)
-        );
-        // cwd fallback: ambiguous
-        assert_eq!(match_pane(None, "/b", &["nomatch"], &panes), (None, true));
-        // nothing matches
-        assert_eq!(match_pane(None, "/z", &["x"], &panes), (None, false));
+        // A session with no surface id isn't under cmux.
+        assert_eq!(match_surface(None, &surfaces), None);
+        // A surface that closed since the sweep → no match, not a guess.
+        assert_eq!(match_surface(Some("uuid-gone"), &surfaces), None);
+        // Empty list.
+        assert_eq!(match_surface(Some("uuid-a"), &[]), None);
     }
 
     #[test]
-    fn env_pane_id_collision_across_instances_is_tiebroken_never_guessed() {
-        // pane ids are only unique WITHIN a wezterm instance — two instances both have pane 5.
-        let mut a = pane(5, "/a", "alpha");
-        a.socket = "C:\\sock-a".to_string();
-        let mut b = pane(5, "/b", "beta");
-        b.socket = "C:\\sock-b".to_string();
-        let panes = [a, b];
-        // The title tie-break picks the right instance.
-        let (m, ambiguous) = match_pane(Some(5), "/z", &["beta"], &panes);
+    fn a_shared_cwd_can_never_cause_a_mismatch() {
+        // The wezterm lane fell back to cwd and had to report ambiguity when two panes shared
+        // one. Identity is by UUID now, so a shared cwd is simply not a factor (spec 012).
+        let surfaces = [surface("uuid-b", 2, "/same"), surface("uuid-c", 3, "/same")];
         assert_eq!(
-            m.map(|p| p.socket),
-            Some("C:\\sock-b".to_string()),
-            "collision resolved by title, not by list order"
-        );
-        assert!(!ambiguous);
-        // No tie-break possible → ambiguous, never a silent guess at the wrong window.
-        assert_eq!(
-            match_pane(Some(5), "/z", &["nomatch"], &panes),
-            (None, true)
+            match_surface(Some("uuid-c"), &surfaces),
+            Some(matched("uuid-c", 3)),
+            "the id decides; the duplicate cwd is not consulted"
         );
     }
 
     #[test]
     fn assemble_falls_back_to_native_name_on_empty_ai_title() {
         // A transcript can carry an empty ai-title — the native name must win over "".
-        let sessions = [session("s1", "/a", "native", NativeStatus::Busy)];
+        let sessions = [session_in(
+            "s1",
+            "/a",
+            "native",
+            NativeStatus::Busy,
+            "uuid-3",
+        )];
         let tel = [telemetry(
             Some(TailFacts {
                 ai_title: Some(String::new()),
@@ -333,12 +271,12 @@ mod tests {
             }),
             Some(1),
         )];
-        let rows = assemble(&sessions, &tel, &[pane(3, "/z", "native")]);
+        let rows = assemble(&sessions, &tel, &[surface("uuid-3", 3, "/z")]);
         assert_eq!(rows[0].name, "native");
         assert_eq!(
             rows[0].pane,
-            Some(matched(3)),
-            "pane still matches via native name"
+            Some(matched("uuid-3", 3)),
+            "the surface matches on id, independent of the name"
         );
     }
 
@@ -360,7 +298,7 @@ mod tests {
     fn assemble_prefers_ai_title_and_sorts_attention_first() {
         let sessions = [
             session("s-idle", "/a", "idle native", NativeStatus::Idle),
-            session("s-ask", "/b", "ask native", NativeStatus::Busy),
+            session_in("s-ask", "/b", "ask native", NativeStatus::Busy, "uuid-7"),
             session("s-work", "/c", "work native", NativeStatus::Busy),
         ];
         let tel = [
@@ -375,11 +313,11 @@ mod tests {
             ),
             telemetry(Some(TailFacts::default()), Some(10)),
         ];
-        let rows = assemble(&sessions, &tel, &[pane(7, "/b", "Pick an option")]);
+        let rows = assemble(&sessions, &tel, &[surface("uuid-7", 7, "/b")]);
         assert_eq!(rows[0].session_id, "s-ask", "NeedsAnswer sorts first");
         assert_eq!(rows[0].status, Status::NeedsAnswer);
         assert_eq!(rows[0].name, "Pick an option", "ai-title wins");
-        assert_eq!(rows[0].pane, Some(matched(7)));
+        assert_eq!(rows[0].pane, Some(matched("uuid-7", 7)));
         assert_eq!(rows[0].context_tokens, Some(120_000));
         assert_eq!(rows[1].status, Status::Working);
         assert_eq!(rows[2].status, Status::Idle);
@@ -414,19 +352,19 @@ mod tests {
     }
 
     #[test]
-    fn pts_flows_to_the_row_only_when_wezterm_pane_is_present() {
-        let with_pane = LiveSession {
-            wezterm_pane: Some(4),
-            pts: Some("/dev/pts/2".to_string()),
+    fn pts_flows_to_the_row_only_when_the_session_is_in_a_cmux_surface() {
+        let in_cmux = LiveSession {
+            surface_id: Some("uuid-4".to_string()),
+            pts: Some("/dev/ttys002".to_string()),
             ..session("s1", "/a", "one", NativeStatus::Busy)
         };
-        let without_pane = LiveSession {
-            wezterm_pane: None,
-            pts: Some("/dev/pts/2".to_string()),
+        let outside_cmux = LiveSession {
+            surface_id: None,
+            pts: Some("/dev/ttys002".to_string()),
             ..session("s2", "/b", "two", NativeStatus::Busy)
         };
         let tel = [Telemetry::default(), Telemetry::default()];
-        let rows = assemble(&[with_pane, without_pane], &tel, &[]);
+        let rows = assemble(&[in_cmux, outside_cmux], &tel, &[]);
         let pts_of = |id: &str| {
             rows.iter()
                 .find(|r| r.session_id == id)
@@ -436,13 +374,13 @@ mod tests {
         };
         assert_eq!(
             pts_of("s1"),
-            Some("/dev/pts/2".to_string()),
-            "wezterm_pane present -> pts flows through to the row"
+            Some("/dev/ttys002".to_string()),
+            "in a cmux surface -> pts flows through to the row"
         );
         assert_eq!(
             pts_of("s2"),
             None,
-            "no wezterm_pane -> never highlightable, pts withheld"
+            "outside cmux -> never highlightable, pts withheld even though ps knew the tty"
         );
     }
 
@@ -457,7 +395,6 @@ mod tests {
             ctx_pct: None,
             secs_since_append: None,
             pane: None,
-            pane_ambiguous: false,
             pts: None,
         }
     }

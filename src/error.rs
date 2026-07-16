@@ -3,10 +3,10 @@
 //! Project: Fleetops — TUI monitoring all running Claude Code sessions (the fleet)
 //! Module:  src/error.rs
 //! Deps:    thiserror
-//! Tested:  exercised via runner/panes tests (no dedicated suite; variants are data)
+//! Tested:  exercised via runner/cmux tests (no dedicated suite; variants are data)
 //!
 //! Key responsibilities:
-//! - `AppError`: subprocess, timeout, parse, and terminal I/O failures.
+//! - `AppError`: subprocess, timeout, and terminal I/O failures.
 //!
 //! Design constraints:
 //! - Messages carry no secrets (pane titles are user-visible task names, fine to include).
@@ -38,10 +38,9 @@ pub enum AppError {
         seconds: u64,
     },
 
-    /// External output did not parse as expected.
-    #[error("parse: {0}")]
-    Parse(String),
-
+    // `Parse` was retired in wave 12: it existed for wezterm's `cli list --format json`, whose
+    // whole-payload deserialize could fail. The cmux + ps parsers are line-oriented and tolerant
+    // by design — a bad row is skipped, never an error — so nothing can construct it.
     /// Terminal / event-loop I/O failure.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
