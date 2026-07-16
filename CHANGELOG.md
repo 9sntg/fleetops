@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+- **The Codex lane works on macOS (spec 014, wave 14)** — it walked `/proc`, so it returned empty
+  here. Now `ps` + `lsof`, and **`/proc` no longer appears anywhere in `src/`**.
+  - **The Linux recognizer could not be reused, and the difference is invisible.** Linux gated on
+    `/proc/<pid>/comm == "codex"` — a bare basename. macOS `ps` reports the FULL PATH
+    (`/Users/…/vendor/aarch64-apple-darwin/bin/codex`), so that test is false for every process,
+    forever: the lane would find nothing and render exactly like "no Codex running". The gate is
+    now `basename(argv0) == "codex"` + argv0-only + owns a tty. Pinned by a regression test.
+  - The node shim (`node …/bin/codex`) shares the real binary's tty AND cwd, so failing to
+    exclude it would have made the cwd join ambiguous and dropped the real session too.
+  - The rollout join key (`/proc/<pid>/cwd` on Linux) has no `ps` equivalent — one batched
+    `lsof -a -d cwd -p <csv> -Fpn` supplies it, and no Codex running costs no `lsof` at all.
+  - Linux's `btime + starttime_ticks / HZ` (with `HZ` hardcoded to 100) is gone: macOS subtracts
+    `ps etime=` from now. No boot time, no HZ guess.
+  - `ps -Awwo pid=,args=` deliberately omits `-E`: it would append the environment to the command
+    with no delimiter, making the argv token count — the whole recognizer — meaningless, and
+    would pull every process's secrets into reach.
+  - Codex sessions under cmux match their surface by `CMUX_SURFACE_ID`, same as Claude.
+  - Verified end-to-end against a real authenticated Codex session: the board shows
+    `hi in one word · 13k · codex`, and 13081 matches the rollout's `token_count` exactly.
+  - Removed with it: `discovery::starttime_from_stat` (this was its last caller), `read_btime`,
+    the `HZ` constant, and the fake-`/proc` test tree.
+
 - **The cmux lane replaces wezterm — pane identity is now exact (spec 012, waves 12–13)** — cmux
   exports `CMUX_SURFACE_ID` into every terminal it starts, and spec 011's single `ps` call already
   reads process environments, so a session's surface comes free with its liveness. Topology and

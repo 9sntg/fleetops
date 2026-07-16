@@ -19,10 +19,9 @@
 //! - The caches are borrowed for the whole call; the TUI passes its persistent ones (held under
 //!   the sweep mutex), the snapshot passes fresh ones. Read-only over the fleet.
 
-use std::path::Path;
-
 use crate::board::{self, SessionRow};
 use crate::cmux::{Surface, SurfaceCache};
+use crate::codex::ProcInfo;
 use crate::discovery::{self, ScanStats};
 use crate::error::AppResult;
 use crate::procsrc::ProcTable;
@@ -42,13 +41,14 @@ pub struct Collected {
     pub codex_count: usize,
 }
 
-/// Scan + fold the whole fleet into sorted rows, reusing the given caches. `panes_result` and
-/// `procs_result` are already fetched by the caller (both off the blocking task).
+/// Scan + fold the whole fleet into sorted rows, reusing the given caches. `surfaces_result`,
+/// `procs_result` and `codex_procs` are already fetched by the caller (all off the blocking task).
 pub fn collect(
     tails: &mut TailCache,
     surface_cache: &mut SurfaceCache,
     surfaces_result: AppResult<Vec<Surface>>,
     procs_result: AppResult<ProcTable>,
+    codex_procs: &[ProcInfo],
 ) -> Collected {
     let claude_dir = paths::claude_dir();
     // A failed `ps` is NOT an empty fleet: liveness is unknowable, so every session would read
@@ -74,7 +74,7 @@ pub fn collect(
     // Surface the more severe one.
     let lane_error = proc_error.or(surface_error);
     let mut rows = board::assemble(&sessions, &telemetry, &surfaces);
-    let codex_rows = codex::scan(&paths::codex_dir(), Path::new("/proc"), &surfaces);
+    let codex_rows = codex::scan(&paths::codex_dir(), codex_procs, &surfaces);
     let codex_count = codex_rows.len();
     rows.extend(codex_rows);
     board::sort_rows(&mut rows);

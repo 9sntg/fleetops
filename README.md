@@ -28,8 +28,8 @@ keypress).
   or cwd) and jumps to it on **Enter**, via cmux's AppleScript `focus`: one call that raises the
   window and focuses the tab.
 - **Codex lane** — Codex CLI sessions (which keep no per-pid session file) are discovered from the
-  process table + their rollout transcript and folded onto the same board. *(Being ported to
-  macOS — see `specs/014`.)*
+  process table + a batched `lsof` for their cwd, joined to their rollout transcript, and folded
+  onto the same board.
 - **Read-only over the fleet** — the only actions that change anything are focusing a surface (the
   jump) and an optional brief highlight of the jumped-to terminal (disable with `--no-highlight`).
   fleetops never writes into any Claude config or session directory.
@@ -98,6 +98,9 @@ credentials — not tokens, not API keys. Specifically, per live session it read
   read into state, logged, or stored.
 - **cmux topology** — cmux's AppleScript interface, for surface ids / tab positions / cwd and the
   jump target. No cmux credential is read or used.
+- **Codex** (only when a Codex TUI is running) — `ps -Awwo pid=,args=` (argv only, never
+  environments), one batched `lsof -d cwd` for the rollout join key, and the rollout tail
+  (`~/.codex/sessions/**/rollout-*.jsonl`) for status/tokens/name.
 
 No data leaves your machine; fleetops makes no network requests.
 

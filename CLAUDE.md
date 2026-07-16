@@ -26,8 +26,10 @@ sources rather than cfg-gating them:
   `cmuxOnly`-gated and would require handling `CMUX_SOCKET_CAPABILITY`, a credential.
 - `src/panes.rs` (wezterm/WSL) is deleted.
 
-**Next:** wave 14 — port the Codex lane (`codex.rs` still walks `/proc`, so it returns empty
-here; it needs `ps` + an `lsof` cwd join). Unverifiable until Codex CLI is installed.
+**Wave 14 (spec 014) ported the Codex lane** to `ps` + a batched `lsof` cwd join, verified
+against a real Codex session. Its Linux gate (`comm == "codex"`) was unusable: macOS `ps` reports
+the full path, so the test was false for every process — the lane would have silently found
+nothing. **No `/proc` reference remains in `src/`.**
 
 ## Tech Stack
 

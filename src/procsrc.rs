@@ -44,20 +44,24 @@ pub struct ProcFacts {
     pub surface_id: Option<String>,
     /// `CLAUDE_ACCOUNT` from the process environment — account attribution. `None` if unset.
     pub account: Option<String>,
+    /// Seconds since the process started (`ps etime=`). The Codex lane's rollout-join guard needs
+    /// the start as an epoch; Linux got it from `btime + starttime/HZ` with a hardcoded HZ guess,
+    /// macOS just subtracts this from `now` (spec 014).
+    pub elapsed_secs: u64,
 }
 
 /// pid → facts, for every process visible to this user.
 pub type ProcTable = HashMap<u32, ProcFacts>;
 
-/// The process-table call: pid, tty, start time and environment for every process, in one spawn.
-/// `-A` = all processes (without it `ps` lists only the caller's terminal); `-E` = append the
-/// environment to the command; `-ww` = never truncate the line.
+/// The process-table call: pid, tty, elapsed, start time and environment for every process, in
+/// one spawn. `-A` = all processes (without it `ps` lists only the caller's terminal); `-E` =
+/// append the environment to the command; `-ww` = never truncate the line.
 pub fn table_spec() -> CommandSpec {
     CommandSpec {
         program: "ps".to_string(),
         args: vec![
             "-AEwwo".to_string(),
-            "pid=,tty=,lstart=,command=".to_string(),
+            "pid=,tty=,etime=,lstart=,command=".to_string(),
         ],
         // Claude Code records procStart in UTC; ps would otherwise format in local time.
         env: vec![("TZ".to_string(), "UTC".to_string())],
@@ -92,6 +96,7 @@ fn parse_row(line: &str) -> Option<(u32, ProcFacts)> {
     let mut fields = line.split_ascii_whitespace();
     let pid: u32 = fields.next()?.parse().ok()?;
     let tty = fields.next()?;
+    let elapsed_secs = parse_etime(fields.next()?)?;
     // Exactly five tokens of lstart; re-joining with single spaces normalizes ps's padding.
     let lstart: Vec<&str> = fields.by_ref().take(LSTART_FIELDS).collect();
     if lstart.len() < LSTART_FIELDS {
@@ -115,8 +120,24 @@ fn parse_row(line: &str) -> Option<(u32, ProcFacts)> {
             tty: parse_tty(tty),
             surface_id,
             account,
+            elapsed_secs,
         },
     ))
+}
+
+/// `ps etime=` → seconds. Formats: `MM:SS`, `HH:MM:SS`, `D-HH:MM:SS` (verified live 2026-07-16).
+fn parse_etime(field: &str) -> Option<u64> {
+    let (days, clock) = field
+        .split_once('-')
+        .map_or((0, field), |(d, rest)| (d.parse().unwrap_or(0), rest));
+    let mut secs = days * 86_400;
+    let parts: Vec<&str> = clock.split(':').collect();
+    // Right-to-left: seconds, minutes, hours — so MM:SS and HH:MM:SS share one path.
+    for (i, part) in parts.iter().rev().enumerate() {
+        let n: u64 = part.trim().parse().ok()?;
+        secs += n * 60u64.pow(u32::try_from(i).ok()?);
+    }
+    Some(secs)
 }
 
 /// `ttys000` → `/dev/ttys000`; `??` (no controlling terminal) → `None`.
@@ -144,7 +165,10 @@ mod tests {
     fn spec_is_explicit_argv_with_utc_and_all_processes() {
         let spec = table_spec();
         assert_eq!(spec.program, "ps");
-        assert_eq!(spec.args, vec!["-AEwwo", "pid=,tty=,lstart=,command="]);
+        assert_eq!(
+            spec.args,
+            vec!["-AEwwo", "pid=,tty=,etime=,lstart=,command="]
+        );
         assert!(
             spec.args[0].contains('A'),
             "-A is load-bearing: without it ps lists only the caller's terminal and every \
@@ -165,12 +189,12 @@ mod tests {
         let table = parse_table(FIXTURE);
         assert_eq!(table.len(), 2, "live fixture: launchd + one cmux session");
 
-        let session = table.get(&23223).expect("session pid present");
-        assert_eq!(session.lstart, "Thu Jul 16 19:39:35 2026");
-        assert_eq!(session.tty.as_deref(), Some("/dev/ttys005"));
+        let session = table.get(&37480).expect("session pid present");
+        assert_eq!(session.lstart, "Thu Jul 16 20:08:03 2026");
+        assert_eq!(session.tty.as_deref(), Some("/dev/ttys007"));
         assert_eq!(
             session.surface_id.as_deref(),
-            Some("02EC2459-2B77-4FA8-A51C-452E80CA19F8"),
+            Some("3D8CB67D-C97A-477F-9770-F7CAF7728808"),
             "the cmux surface id is the exact pane identity"
         );
 
@@ -178,6 +202,7 @@ mod tests {
         assert_eq!(launchd.tty, None, "?? means no controlling terminal");
         assert_eq!(launchd.lstart, "Thu Jul 16 18:23:29 2026");
         assert_eq!(launchd.surface_id, None, "not under cmux");
+        assert!(launchd.elapsed_secs > 0, "etime parsed into seconds");
     }
 
     #[test]
@@ -186,7 +211,7 @@ mod tests {
         // cmux includes CMUX_SOCKET_CAPABILITY — an auth token. The fixture deliberately carries
         // one. Nothing outside the allowlist may ever be captured.
         let table = parse_table(FIXTURE);
-        let session = table.get(&23223).expect("session pid present");
+        let session = table.get(&37480).expect("session pid present");
         let captured = format!("{session:?}");
         assert!(
             !captured.contains("CMUX_SOCKET_CAPABILITY") && !captured.contains("REDACTED-SECRET"),
@@ -203,14 +228,14 @@ mod tests {
         // The whole port rests on this: the session file recorded procStart in UTC, and
         // TZ=UTC ps reproduces it byte-for-byte.
         let table = parse_table(FIXTURE);
-        let observed = &table.get(&23223).expect("pid present").lstart;
-        assert_eq!(*observed, normalize_lstart("Thu Jul 16 19:39:35 2026"));
+        let observed = &table.get(&37480).expect("pid present").lstart;
+        assert_eq!(*observed, normalize_lstart("Thu Jul 16 20:08:03 2026"));
     }
 
     #[test]
     fn a_command_line_is_never_mistaken_for_a_start_time() {
         // lstart is exactly five tokens; the command that follows must not leak into it.
-        let table = parse_table(b"42 ttys001 Thu Jul 16 19:10:07 2026 /bin/zsh -l FOO=bar\n");
+        let table = parse_table(b"42 ttys001 01:02 Thu Jul 16 19:10:07 2026 /bin/zsh -l FOO=bar\n");
         let facts = table.get(&42).expect("row parses");
         assert_eq!(facts.lstart, "Thu Jul 16 19:10:07 2026");
         assert_eq!(facts.surface_id, None);
@@ -233,11 +258,11 @@ mod tests {
 
     #[test]
     fn malformed_lines_are_skipped_not_fatal() {
-        let input = b"12 ttys001 Thu Jul 16 19:10:07 2026\n\
-                      not-a-pid ttys002 Thu Jul 16 19:10:07 2026\n\
+        let input = b"12 ttys001 01:02 Thu Jul 16 19:10:07 2026\n\
+                      not-a-pid ttys002 01:02 Thu Jul 16 19:10:07 2026\n\
                       \n\
-                      99 ttys003\n\
-                      13 ttys004 Thu Jul 16 19:11:00 2026\n";
+                      99 ttys003 01:02\n\
+                      13 ttys004 03:04:05 Thu Jul 16 19:11:00 2026\n";
         let table = parse_table(input);
         assert_eq!(table.len(), 2, "two good rows survive");
         assert!(table.contains_key(&12) && table.contains_key(&13));
@@ -272,9 +297,23 @@ mod tests {
     }
 
     #[test]
+    fn etime_table() {
+        // ps etime formats, verified live 2026-07-16: MM:SS and HH:MM:SS; D-HH:MM:SS past a day.
+        assert_eq!(parse_etime("01:49"), Some(109));
+        assert_eq!(parse_etime("02:07:44"), Some(7_664));
+        assert_eq!(
+            parse_etime("3-04:05:06"),
+            Some(3 * 86_400 + 4 * 3_600 + 5 * 60 + 6)
+        );
+        assert_eq!(parse_etime("00:00"), Some(0));
+        assert_eq!(parse_etime("garbage"), None);
+        assert_eq!(parse_etime(""), None);
+    }
+
+    #[test]
     fn account_is_extracted_when_present() {
         let table =
-            parse_table(b"7 ttys001 Thu Jul 16 19:10:07 2026 claude CLAUDE_ACCOUNT=alpha\n");
+            parse_table(b"7 ttys001 00:30 Thu Jul 16 19:10:07 2026 claude CLAUDE_ACCOUNT=alpha\n");
         assert_eq!(
             table.get(&7).expect("row").account.as_deref(),
             Some("alpha")

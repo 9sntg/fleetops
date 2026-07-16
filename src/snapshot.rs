@@ -84,6 +84,11 @@ pub async fn run(runner: &dyn Runner) -> (String, bool) {
         cmux::list(runner),
         crate::procsrc::fetch(runner)
     );
+    // The Codex lane needs the process table, so it follows it.
+    let codex_procs = match &procs_result {
+        Ok(table) => crate::codex::fetch(runner, table).await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
     let collected = tokio::task::spawn_blocking(move || {
         // Fresh caches: a one-shot has nothing to reuse across sweeps.
         let mut tails = crate::telemetry::TailCache::default();
@@ -93,6 +98,7 @@ pub async fn run(runner: &dyn Runner) -> (String, bool) {
             &mut surface_cache,
             surfaces_result,
             procs_result,
+            &codex_procs,
         )
     })
     .await;

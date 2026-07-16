@@ -4,23 +4,26 @@
 //! Project: Fleetops — TUI monitoring all running Claude Code sessions (the fleet)
 //! Module:  src/codex.rs
 //! Deps:    serde/serde_json (rollout JSON); std::fs (via `scan`, called by the sensor's
-//!          spawn_blocking); board (SessionRow, match_surface); discovery
-//!          (starttime_from_stat); fold (Status, STALL_AFTER_SECS); cmux (Surface)
+//!          spawn_blocking); board (SessionRow, match_surface); procsrc (ProcTable); runner
+//!          (the ps/lsof seam); fold (Status, STALL_AFTER_SECS); cmux (Surface)
 //! Tested:  inline `#[cfg(test)]` — synthetic rollout JSONL lines + tempdir fake `/proc` +
 //!          `~/.codex/sessions` tree (house pattern, see discovery.rs/telemetry.rs)
 //!
 //! Key responsibilities:
-//! - Recognize a Codex TUI process: `comm == "codex"`, argv0-only cmdline, `fd/1 -> /dev/pts/*`
-//!   (`is_codex_tui`) — the node shim (`comm == "node"`) and `codex exec`/`--version` are
-//!   skipped for free (comm mismatch / extra argv).
+//! - Recognize a Codex TUI process: argv0-only whose BASENAME is `codex`, owning a tty
+//!   (`is_codex_tui`) — the node shim (argv0 `node`) and `codex exec`/`--version` are skipped
+//!   (basename mismatch / extra argv). macOS `ps` reports comm as a FULL PATH, so Linux's
+//!   `comm == "codex"` test would be false for every process — see `is_codex_tui` (spec 014).
 //! - Parse a rollout's `session_meta` line 0 (`parse_session_meta`) and fold its tail
 //!   (`fold_rollout_tail`) into status/tokens/ctx%/name per the spec 008 status table.
 //! - Join each live process to its newest same-cwd rollout, without sqlite (v1): a liveness
 //!   guard rejects a rollout mtime older than the process's own start minus a slack window; two
 //!   processes sharing a cwd never join (`join_rollouts` — never guess, house rule).
+//! - `fetch`: the async process lane — `ps -Awwo pid=,args=` for the gate, then ONE batched
+//!   `lsof -d cwd` for the join key (macOS ps has no cwd field).
 //! - `scan`: the one fs-touching entry point, mirroring `discovery::scan`'s shape — walks
-//!   `proc_root` for live Codex TUIs and `codex_root/sessions/**/rollout-*.jsonl` for
-//!   candidates, joins them, and assembles `SessionRow`s (matched via `board::match_surface`).
+//!   `codex_root/sessions/**/rollout-*.jsonl` for candidates, joins them to the fetched
+//!   processes, and assembles `SessionRow`s (matched via `board::match_surface`).
 //!
 //! Design constraints:
 //! - Read-only over `~/.codex`; never writes.
@@ -32,15 +35,17 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::board::{self, SessionRow};
 use crate::cmux::Surface;
-use crate::discovery;
+use crate::error::AppResult;
 use crate::fold::{self, Status};
+use crate::procsrc::ProcTable;
+use crate::runner::{CommandSpec, Runner};
 
 /// `session_meta` line 0 of a rollout — tolerant, unknown fields skipped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,18 +188,25 @@ pub fn fold_rollout_tail(bytes: &[u8], age_secs: Option<u64>) -> RolloutFacts {
     }
 }
 
-/// A Codex TUI process: `comm == "codex"` AND argv0-only cmdline AND `fd/1 -> /dev/pts/*`. The
-/// node shim (`comm == "node"`) and `codex exec`/`codex --version` are skipped for free (comm
-/// mismatch / extra argv).
-pub fn is_codex_tui(comm: &str, cmdline: &[u8], fd1_target: Option<&str>) -> bool {
-    let argv0_only = cmdline
-        .split(|&b| b == 0)
-        .filter(|arg| !arg.is_empty())
-        .count()
-        == 1;
-    comm.trim_end() == "codex"
-        && argv0_only
-        && fd1_target.is_some_and(|t| t.starts_with("/dev/pts/"))
+/// A Codex TUI process: argv is exactly one token whose basename is `codex`, and it owns a tty.
+///
+/// macOS shape, verified live 2026-07-16 — this is NOT Linux's rule and the difference is the
+/// whole reason wave 14 could not be written blind:
+/// - Linux read `/proc/<pid>/comm`, the bare basename `"codex"`. macOS `ps` reports the FULL
+///   PATH (`/Users/…/vendor/aarch64-apple-darwin/bin/codex`), so a `== "codex"` test is false
+///   for every process, forever — the lane would find nothing and look exactly like "no Codex
+///   running". Hence `basename`.
+/// - The node shim (`node /…/bin/codex`) shares the real binary's tty AND cwd, so it must be
+///   excluded or the cwd join goes ambiguous and drops both: its argv0 basename is `node`.
+/// - `codex exec …` / `codex --version` carry extra argv tokens.
+pub fn is_codex_tui(argv: &str, tty: Option<&str>) -> bool {
+    let mut tokens = argv.split_ascii_whitespace();
+    let Some(argv0) = tokens.next() else {
+        return false;
+    };
+    let argv0_only = tokens.next().is_none();
+    let basename = argv0.rsplit('/').next().unwrap_or(argv0);
+    basename == "codex" && argv0_only && tty.is_some()
 }
 
 /// One live Codex process's already-read join facts (spec 008 discovery).
@@ -253,39 +265,41 @@ const MAX_ROLLOUTS: usize = 300;
 /// codex turn can stream well over 64 KiB of `response_item` output, which would push the last
 /// `user_message` line out of a smaller window and cost the row its name.
 const TAIL_BYTES: u64 = 256 * 1024;
-/// WSL2 clock ticks/sec (HZ) — hardcoded per recon; a wrong value only loosens the join guard
-/// (degrading to newest-per-cwd), never rejects a live process.
-const HZ: u64 = 100;
-
-/// One live Codex TUI process's already-read facts (scan-internal; `CodexProc` is the pure join
-/// input derived from this).
-struct ProcInfo {
+/// One live Codex TUI process's already-fetched facts (scan-internal; `CodexProc` is the pure
+/// join input derived from this). Fetched by `fetch`, off the blocking task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcInfo {
     pid: u32,
     cwd: String,
     pts: Option<String>,
     surface_id: Option<String>,
-    start_wallclock_secs: u64,
+    /// Seconds since this process started (`ps etime=`); `scan` turns it into an epoch.
+    elapsed_secs: u64,
 }
 
-/// Scan `codex_root` for rollouts and `proc_root` for live Codex TUI processes, join them, and
-/// return assembled `SessionRow`s — matched against `surfaces` via `board::match_surface`
-/// (env pane id only). Blocking fs work — the sensor calls this inside `spawn_blocking`, same
-/// pattern as `discovery::scan`.
-pub fn scan(codex_root: &Path, proc_root: &Path, surfaces: &[Surface]) -> Vec<SessionRow> {
-    let proc_infos = scan_procs(proc_root);
+/// Scan `codex_root` for rollouts, join them to the already-fetched live Codex TUI processes,
+/// and return assembled `SessionRow`s — matched against `surfaces` via `board::match_surface`.
+/// Blocking fs work — the sensor calls this inside `spawn_blocking`, same pattern as
+/// `discovery::scan`; `proc_infos` comes from `fetch`, off the blocking task.
+pub fn scan(codex_root: &Path, proc_infos: &[ProcInfo], surfaces: &[Surface]) -> Vec<SessionRow> {
+    if proc_infos.is_empty() {
+        return Vec::new(); // no Codex running — skip the rollout walk entirely
+    }
     let (candidates, paths_by_id) = scan_rollouts(codex_root);
-    let join_procs: Vec<CodexProc> = proc_infos
-        .iter()
-        .map(|p| CodexProc {
-            cwd: p.cwd.clone(),
-            start_wallclock_secs: p.start_wallclock_secs,
-        })
-        .collect();
-    let joined = join_rollouts(&join_procs, &candidates);
     // The one impure edge (spec 008): rollout age is computed against wallclock now, here only.
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
+    let join_procs: Vec<CodexProc> = proc_infos
+        .iter()
+        .map(|p| CodexProc {
+            cwd: p.cwd.clone(),
+            // Linux derived this from btime + starttime/HZ with a hardcoded HZ guess; macOS just
+            // subtracts the elapsed time ps already reports (spec 014).
+            start_wallclock_secs: now_secs.saturating_sub(p.elapsed_secs),
+        })
+        .collect();
+    let joined = join_rollouts(&join_procs, &candidates);
 
     proc_infos
         .iter()
@@ -297,60 +311,101 @@ pub fn scan(codex_root: &Path, proc_root: &Path, surfaces: &[Surface]) -> Vec<Se
         .collect()
 }
 
-/// Walk `proc_root` for live Codex TUI processes (comm/cmdline/fd1 gate via `is_codex_tui`).
-fn scan_procs(proc_root: &Path) -> Vec<ProcInfo> {
-    let btime = read_btime(proc_root);
-    let Ok(entries) = std::fs::read_dir(proc_root) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
-            read_proc_info(proc_root, pid, btime)
+/// The Codex process-discovery call: pid + full argv for every process.
+///
+/// Deliberately NOT `-E`: the Claude lane's table needs environments (for `CMUX_SURFACE_ID`), but
+/// this lane only needs argv, and `ps -E` appends the environment to the command with no
+/// delimiter — argv and environ would be indistinguishable, and the gate counts argv tokens.
+/// Keeping `-E` off makes the token count exact AND keeps every process's secrets out of reach.
+pub fn procs_spec() -> CommandSpec {
+    CommandSpec {
+        program: "ps".to_string(),
+        args: vec!["-Awwo".to_string(), "pid=,args=".to_string()],
+        env: Vec::new(),
+        timeout: Duration::from_secs(5),
+    }
+}
+
+/// The cwd call — the rollout join key. macOS `ps` has no cwd field, so `lsof` supplies it; one
+/// batched call for all candidate pids, never one per pid.
+pub fn cwds_spec(pids: &[u32]) -> CommandSpec {
+    let csv = pids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    CommandSpec {
+        program: "lsof".to_string(),
+        args: vec![
+            "-a".to_string(),
+            "-d".to_string(),
+            "cwd".to_string(),
+            "-p".to_string(),
+            csv,
+            "-Fpn".to_string(),
+        ],
+        env: Vec::new(),
+        timeout: Duration::from_secs(5),
+    }
+}
+
+/// Parse `ps -Awwo pid=,args=` → the pids that pass the Codex TUI argv gate, with their argv.
+/// `tty_of` supplies each pid's tty from the shared process table.
+pub fn parse_procs(bytes: &[u8], tty_of: &dyn Fn(u32) -> Option<String>) -> Vec<u32> {
+    let text = String::from_utf8_lossy(bytes);
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let (pid, argv) = line.split_once(char::is_whitespace)?;
+            let pid: u32 = pid.parse().ok()?;
+            is_codex_tui(argv.trim(), tty_of(pid).as_deref()).then_some(pid)
         })
         .collect()
 }
 
-/// `btime` (boot time, epoch secs) from `<proc_root>/stat` — missing/unreadable degrades to 0,
-/// which only loosens the join liveness guard (spec 008), never rejects a live process.
-fn read_btime(proc_root: &Path) -> u64 {
-    std::fs::read_to_string(proc_root.join("stat"))
-        .ok()
-        .and_then(|content| {
-            content
-                .lines()
-                .find_map(|l| l.strip_prefix("btime "))
-                .and_then(|v| v.trim().parse().ok())
-        })
-        .unwrap_or(0)
+/// Parse `lsof -Fpn` field output: `p<pid>` lines followed by `n<path>` lines.
+pub fn parse_cwds(bytes: &[u8]) -> HashMap<u32, String> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = HashMap::new();
+    let mut current: Option<u32> = None;
+    for line in text.lines() {
+        if let Some(pid) = line.strip_prefix('p') {
+            current = pid.trim().parse().ok();
+        } else if let Some(path) = line.strip_prefix('n') {
+            if let Some(pid) = current {
+                // First n-line per pid wins; `-d cwd` yields exactly one.
+                out.entry(pid).or_insert_with(|| path.trim().to_string());
+            }
+        }
+    }
+    out
 }
 
-/// Read one `/proc/<pid>`'s facts; `None` unless it passes the `is_codex_tui` gate.
-fn read_proc_info(proc_root: &Path, pid: u32, btime: u64) -> Option<ProcInfo> {
-    let dir = proc_root.join(pid.to_string());
-    let comm = std::fs::read_to_string(dir.join("comm")).ok()?;
-    let cmdline = std::fs::read(dir.join("cmdline")).ok()?;
-    let fd1_target = std::fs::read_link(dir.join("fd").join("1"))
-        .ok()
-        .and_then(|t| t.to_str().map(str::to_string));
-    if !is_codex_tui(&comm, &cmdline, fd1_target.as_deref()) {
-        return None;
+/// Fetch live Codex TUI processes: the argv gate, then one batched `lsof` for their cwds.
+/// Async — the caller runs this off the blocking task and hands the result to `scan`, exactly
+/// like the Claude lane's process table and the cmux topology.
+pub async fn fetch(runner: &dyn Runner, table: &ProcTable) -> AppResult<Vec<ProcInfo>> {
+    let bytes = runner.run(&procs_spec()).await?;
+    let pids = parse_procs(&bytes, &|pid| table.get(&pid).and_then(|f| f.tty.clone()));
+    if pids.is_empty() {
+        return Ok(Vec::new()); // no Codex running is the common case, and costs no lsof
     }
-    let cwd = std::fs::read_link(dir.join("cwd"))
-        .ok()
-        .and_then(|t| t.to_str().map(str::to_string))?;
-    let stat = std::fs::read_to_string(dir.join("stat")).ok()?;
-    let starttime_ticks: u64 = discovery::starttime_from_stat(&stat)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    Some(ProcInfo {
-        pid,
-        cwd,
-        pts: fd1_target,
-        surface_id: None, // wave 14: the macOS codex lane reads CMUX_SURFACE_ID from procsrc
-        start_wallclock_secs: btime + starttime_ticks / HZ,
-    })
+    let cwd_bytes = runner.run(&cwds_spec(&pids)).await?;
+    let cwds = parse_cwds(&cwd_bytes);
+    Ok(pids
+        .into_iter()
+        .filter_map(|pid| {
+            let facts = table.get(&pid)?;
+            Some(ProcInfo {
+                pid,
+                // No cwd -> no join key -> the row would be unjoinable anyway.
+                cwd: cwds.get(&pid)?.clone(),
+                pts: facts.tty.clone(),
+                surface_id: facts.surface_id.clone(),
+                elapsed_secs: facts.elapsed_secs,
+            })
+        })
+        .collect())
 }
 
 /// Walk `codex_root/sessions/*/*/*/rollout-*.jsonl`, newest-first by MTIME, capped, parsed into
@@ -518,28 +573,127 @@ mod tests {
 
     // --- is_codex_tui ---
 
+    /// The real macOS argv0, captured live 2026-07-16 from a running Codex TUI.
+    const REAL_ARGV0: &str = "/Users/user/.nvm/versions/node/v24.18.0/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex";
+
     #[test]
     fn is_codex_tui_table() {
-        let cases: &[(&str, &[u8], Option<&str>, bool)] = &[
-            // the interactive TUI: comm codex, argv0 only, real pts
-            ("codex\n", b"codex\0", Some("/dev/pts/4"), true),
-            // `codex exec <prompt>` — extra argv, transient, must be skipped
-            ("codex\n", b"codex\0exec\0", Some("/dev/pts/4"), false),
-            // `codex --version` — extra argv, transient, must be skipped
-            ("codex\n", b"codex\0--version\0", Some("/dev/pts/4"), false),
-            // the node shim wrapping codex — comm mismatch, skipped for free
-            ("node\n", b"codex\0", Some("/dev/pts/4"), false),
-            // fd/1 not a pty (e.g. redirected to a file) — never a TUI target
-            ("codex\n", b"codex\0", Some("/dev/null"), false),
-            ("codex\n", b"codex\0", None, false),
+        let node_shim = "node /Users/user/.nvm/versions/node/v24.18.0/bin/codex";
+        let exec_form = format!("{REAL_ARGV0} exec --json 'do a thing'");
+        let cases: &[(&str, Option<&str>, bool)] = &[
+            // The interactive TUI as macOS actually reports it: argv0 is the FULL PATH to the
+            // vendored binary, alone, on a tty. Linux's `comm == "codex"` test would reject this.
+            (REAL_ARGV0, Some("/dev/ttys011"), true),
+            // A short path still works — the gate is on the basename, not the whole string.
+            ("/opt/homebrew/bin/codex", Some("/dev/ttys004"), true),
+            // The node shim: shares the real binary's tty AND cwd, so it MUST be excluded or the
+            // cwd join sees two processes and drops both. argv0's basename is `node`.
+            (node_shim, Some("/dev/ttys011"), false),
+            // `codex exec …` — extra argv, transient, must be skipped.
+            (&exec_form, Some("/dev/ttys011"), false),
+            (
+                "/opt/homebrew/bin/codex --version",
+                Some("/dev/ttys004"),
+                false,
+            ),
+            // No tty (piped/daemonized) — never a TUI target.
+            (REAL_ARGV0, None, false),
+            // Not codex at all.
+            ("/bin/zsh -l", Some("/dev/ttys004"), false),
+            ("", Some("/dev/ttys004"), false),
         ];
-        for (comm, cmdline, fd1, want) in cases {
-            assert_eq!(
-                is_codex_tui(comm, cmdline, *fd1),
-                *want,
-                "comm={comm:?} cmdline={cmdline:?} fd1={fd1:?}"
-            );
+        for (argv, tty, want) in cases {
+            assert_eq!(is_codex_tui(argv, *tty), *want, "argv={argv:?} tty={tty:?}");
         }
+    }
+
+    #[test]
+    fn the_full_path_comm_is_why_linuxs_rule_could_not_be_reused() {
+        // Regression pin for spec 014's central finding. On Linux `/proc/<pid>/comm` is the bare
+        // basename, so the gate was `comm == "codex"`. macOS reports the full path, so that test
+        // is false for EVERY process — the lane would find nothing and be indistinguishable from
+        // "no Codex running". This is the assertion that would have caught a blind port.
+        assert_ne!(
+            REAL_ARGV0, "codex",
+            "macOS never hands back a bare basename"
+        );
+        assert!(is_codex_tui(REAL_ARGV0, Some("/dev/ttys011")));
+    }
+
+    // --- the macOS process lane (ps + lsof) ---
+
+    const PS_ARGS_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/ps-codex-args.txt");
+    const LSOF_FIXTURE: &[u8] = include_bytes!("../tests/fixtures/lsof-cwd.txt");
+
+    #[test]
+    fn ps_fixture_finds_the_real_binary_and_rejects_the_shim() {
+        // Captured live 2026-07-16 from a running `codex` TUI: the real vendored binary (51450)
+        // and the node shim that launched it (51448). Both are on the SAME tty and the SAME cwd,
+        // so the shim must be rejected by argv alone or the cwd join sees two and drops both.
+        let tty = |_pid: u32| Some("/dev/ttys011".to_string());
+        let pids = parse_procs(PS_ARGS_FIXTURE, &tty);
+        assert_eq!(pids, vec![51450], "only the real codex binary");
+    }
+
+    #[test]
+    fn ps_gate_requires_a_tty_so_a_piped_codex_is_not_a_tui() {
+        let no_tty = |_pid: u32| None;
+        assert!(parse_procs(PS_ARGS_FIXTURE, &no_tty).is_empty());
+    }
+
+    #[test]
+    fn ps_rows_that_are_garbage_are_skipped_not_fatal() {
+        let tty = |_pid: u32| Some("/dev/ttys001".to_string());
+        let input = b"not-a-pid /opt/homebrew/bin/codex\n\n99\n  7 /opt/homebrew/bin/codex\n";
+        assert_eq!(parse_procs(input, &tty), vec![7]);
+    }
+
+    #[test]
+    fn lsof_fixture_yields_the_cwd_join_key() {
+        // Captured live 2026-07-16. `-Fpn` emits p<pid> then n<path> per process.
+        let cwds = parse_cwds(LSOF_FIXTURE);
+        assert_eq!(cwds.get(&51450).map(String::as_str), Some("/private/tmp"));
+        assert_eq!(cwds.get(&51448).map(String::as_str), Some("/private/tmp"));
+        assert_eq!(cwds.len(), 2);
+    }
+
+    #[test]
+    fn lsof_garbage_is_empty_not_a_panic() {
+        assert!(parse_cwds(b"").is_empty());
+        assert!(parse_cwds(b"total nonsense").is_empty());
+        assert!(
+            parse_cwds(b"n/orphan/path\n").is_empty(),
+            "an n-line with no preceding p-line names no process"
+        );
+    }
+
+    #[test]
+    fn specs_are_explicit_argv_and_the_ps_call_never_asks_for_environments() {
+        let spec = procs_spec();
+        assert_eq!(spec.program, "ps");
+        assert_eq!(spec.args, vec!["-Awwo", "pid=,args="]);
+        assert!(
+            !spec.args[0].contains('E'),
+            "-E would append the environment to the command with no delimiter, making the argv \
+             token count (the whole gate) meaningless — and would pull every process's secrets in"
+        );
+        let cwds = cwds_spec(&[7, 9]);
+        assert_eq!(cwds.program, "lsof");
+        assert!(cwds.args.contains(&"7,9".to_string()), "one batched call");
+    }
+
+    #[tokio::test]
+    async fn fetch_skips_lsof_entirely_when_no_codex_is_running() {
+        use crate::runner::CannedRunner;
+        let runner = CannedRunner::new(b"  888 /bin/zsh -l\n".to_vec());
+        let table = ProcTable::new();
+        let procs = fetch(&runner, &table).await.expect("ok");
+        assert!(procs.is_empty());
+        assert_eq!(
+            runner.all_specs().len(),
+            1,
+            "no Codex is the common case; it must not cost an lsof"
+        );
     }
 
     // --- parse_session_meta ---
@@ -754,23 +908,15 @@ mod tests {
 
     const NO_PROMPT_YET: &str = "codex — no prompt yet";
 
-    /// Build a fake `/proc/<pid>` for a Codex TUI: comm/cmdline/environ/stat + fd/1 and cwd
-    /// symlinks (mirrors `discovery::tests::fake_proc`, extended for codex's own shape).
-    fn fake_codex_proc(root: &Path, pid: u32, cwd: &Path, pane: u64, pts_num: &str) {
-        let dir = root.join(pid.to_string());
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("comm"), "codex\n").unwrap();
-        std::fs::write(dir.join("cmdline"), b"codex\0").unwrap();
-        std::fs::write(dir.join("environ"), format!("WEZTERM_PANE={pane}\0")).unwrap();
-        std::fs::write(
-            dir.join("stat"),
-            format!("{pid} (codex) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 100 23"),
-        )
-        .unwrap();
-        let fd = dir.join("fd");
-        std::fs::create_dir_all(&fd).unwrap();
-        std::os::unix::fs::symlink(format!("/dev/pts/{pts_num}"), fd.join("1")).unwrap();
-        std::os::unix::fs::symlink(cwd, dir.join("cwd")).unwrap();
+    /// A live Codex TUI process, as `codex::fetch` would have returned it.
+    fn live_proc(pid: u32, cwd: &Path, pts: &str, elapsed_secs: u64) -> ProcInfo {
+        ProcInfo {
+            pid,
+            cwd: cwd.to_str().unwrap().to_string(),
+            pts: Some(pts.to_string()),
+            surface_id: None,
+            elapsed_secs,
+        }
     }
 
     /// Write one rollout file: `session_meta` line 0 + whatever tail lines are given.
@@ -790,33 +936,40 @@ mod tests {
     }
 
     #[test]
-    fn scan_joins_one_process_to_its_rollout_and_matches_the_pane() {
+    fn scan_joins_one_process_to_its_rollout_and_matches_the_surface() {
         let tmp = std::env::temp_dir().join(format!("fleet-codex-scan-{}", std::process::id()));
         let codex_root = tmp.join("codex");
-        let proc_root = tmp.join("proc");
         let real_cwd = tmp.join("workdir");
         std::fs::create_dir_all(&real_cwd).unwrap();
-        fake_codex_proc(&proc_root, 500, &real_cwd, 27, "8");
+        let mut proc = live_proc(500, &real_cwd, "/dev/ttys008", 30);
+        proc.surface_id = Some("uuid-codex".to_string());
         write_rollout(
             &codex_root,
             "11111111-1111-1111-1111-111111111111",
             real_cwd.to_str().unwrap(),
             &[event_line("task_complete")],
         );
-        let rows = scan(&codex_root, &proc_root, &[]);
+        let surfaces = [Surface {
+            id: "uuid-codex".to_string(),
+            window_index: 1,
+            tab_index: 3,
+            cwd: String::new(),
+        }];
+        let rows = scan(&codex_root, &[proc], &surfaces);
         std::fs::remove_dir_all(&tmp).ok();
 
         assert_eq!(rows.len(), 1, "one codex TUI process, one row");
         let row = &rows[0];
         assert_eq!(row.account.as_deref(), Some("codex"));
         assert_eq!(
-            row.pane, None,
-            "wave 12: the Codex lane carries no CMUX_SURFACE_ID yet, so it never matches a \
-             surface. Wave 14 sources it from procsrc like the Claude lane."
+            row.pane.as_ref().map(|p| p.tab_index),
+            Some(3),
+            "a Codex session under cmux matches its surface by exact id, same as Claude"
         );
         assert_eq!(
-            row.pts, None,
-            "and with no surface the highlight write-target guard withholds the pts"
+            row.pts.as_deref(),
+            Some("/dev/ttys008"),
+            "with a surface, the highlight write-target guard lets the tty through"
         );
         assert_eq!(row.status, Status::Idle, "task_complete tail");
         assert_eq!(
@@ -874,12 +1027,11 @@ mod tests {
         let tmp =
             std::env::temp_dir().join(format!("fleet-codex-scan-noprompt-{}", std::process::id()));
         let codex_root = tmp.join("codex"); // no sessions dir at all
-        let proc_root = tmp.join("proc");
         let real_cwd = tmp.join("workdir");
         std::fs::create_dir_all(&real_cwd).unwrap();
-        fake_codex_proc(&proc_root, 600, &real_cwd, 0, "9");
+        let proc = live_proc(600, &real_cwd, "/dev/ttys009", 12);
 
-        let rows = scan(&codex_root, &proc_root, &[]);
+        let rows = scan(&codex_root, &[proc], &[]);
         std::fs::remove_dir_all(&tmp).ok();
 
         assert_eq!(

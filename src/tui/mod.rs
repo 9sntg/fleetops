@@ -33,7 +33,7 @@ use crate::cmux::SurfaceCache;
 use crate::error::AppResult;
 use crate::runner::{Exec, Runner};
 use crate::telemetry::TailCache;
-use crate::{board, cmux, collect, highlight, procsrc};
+use crate::{board, cmux, codex, collect, highlight, procsrc};
 
 use model::{App, Msg, Snapshot};
 
@@ -169,6 +169,12 @@ fn spawn_sweep(
 async fn sweep(runner: &dyn Runner, cache: &Arc<Mutex<SweepCaches>>) -> Result<Snapshot, String> {
     // Independent lanes — fetch concurrently.
     let (surfaces_result, procs_result) = tokio::join!(cmux::list(runner), procsrc::fetch(runner));
+    // The Codex lane needs the process table (tty gate, surface id, elapsed), so it follows it.
+    // A failed Codex lane costs its rows, never the board.
+    let codex_procs = match &procs_result {
+        Ok(table) => codex::fetch(runner, table).await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
     let cache = Arc::clone(cache);
     tokio::task::spawn_blocking(move || {
         let mut guard = match cache.lock() {
@@ -178,7 +184,8 @@ async fn sweep(runner: &dyn Runner, cache: &Arc<Mutex<SweepCaches>>) -> Result<S
         // `collect` is the SAME pipeline `snapshot::run` uses, so the board and the snapshot
         // can never disagree (spec 009). The caches are held only for its duration, then dropped.
         let SweepCaches { tails, surfaces } = &mut *guard;
-        let collected = collect::collect(tails, surfaces, surfaces_result, procs_result);
+        let collected =
+            collect::collect(tails, surfaces, surfaces_result, procs_result, &codex_procs);
         drop(guard); // release the caches before returning (lock-contention hygiene)
         Snapshot {
             seq: 0, // stamped by spawn_sweep

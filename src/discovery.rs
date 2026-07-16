@@ -145,17 +145,6 @@ pub fn parse_session_file(bytes: &[u8]) -> Option<SessionFile> {
     })
 }
 
-/// Extract starttime (field 22) from Linux `/proc/<pid>/stat` content.
-/// comm (field 2) may contain spaces and parens — fields are counted after the LAST `)`.
-///
-/// Linux legacy: the Claude lane stopped using this in wave 11 (macOS has no `/proc`); it
-/// survives only because `codex.rs` still walks `/proc`. Wave 14 deletes both together.
-pub fn starttime_from_stat(stat: &str) -> Option<&str> {
-    let after_comm = &stat[stat.rfind(')')? + 1..];
-    // after_comm starts at field 3 (state); starttime is field 22 → index 19 here.
-    after_comm.split_ascii_whitespace().nth(19)
-}
-
 /// Scan `sessions_dir` and filter by liveness against the `ps` process table. Blocking fs work —
 /// the sensor calls this inside `spawn_blocking`, having fetched `procs` off the blocking task.
 pub fn scan(sessions_dir: &Path, procs: &ProcTable) -> (Vec<LiveSession>, ScanStats) {
@@ -247,15 +236,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn starttime_survives_parens_and_spaces_in_comm() {
-        // After the last ')': state is field 3 (index 0), starttime is field 22 (index 19),
-        // so 18 filler fields sit between them.
-        let stat = "42 (weird) name)) R 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 START 23";
-        assert_eq!(starttime_from_stat(stat), Some("START"));
-        assert_eq!(starttime_from_stat("no parens here"), None);
-    }
-
     /// Build a canned process table row — the `ps` output the sensor would have fetched.
     fn proc_row(table: &mut ProcTable, pid: u32, lstart: &str, tty: Option<&str>) {
         table.insert(
@@ -265,6 +245,7 @@ mod tests {
                 tty: tty.map(str::to_string),
                 surface_id: None,
                 account: None,
+                elapsed_secs: 0,
             },
         );
     }
