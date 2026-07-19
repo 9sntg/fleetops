@@ -19,6 +19,11 @@
 //!   both inside and outside cmux. Verified live 2026-07-16 (spec 012).
 //! - The surface id is passed as `osascript` **argv**, never interpolated into the script, so a
 //!   hostile id is inert data rather than code. Verified by test.
+//! - `LIST_SCRIPT` uses BULK plural queries (`id of every terminal of every tab of w`), never a
+//!   per-terminal `of tm` inside a loop. Each accessor crossing the `tell` boundary is its own
+//!   Apple Event, delivered synchronously to cmux's main thread; the nested-loop form cost 179 ms
+//!   per sweep against 94 ms for this one, and that time is stolen from cmux's UI. Rewriting it
+//!   into the more readable nested form re-introduces the freeze (spec 016, plan 003).
 //! - `character id 9` is bound OUTSIDE the `tell` block: cmux's dictionary defines a `tab`
 //!   CLASS, which shadows AppleScript's `tab` (tab-character) constant inside `tell` and would
 //!   silently emit the literal text "tab" as the delimiter.
@@ -46,18 +51,29 @@ pub struct Surface {
 }
 
 /// Emit one tab-separated row per terminal: `id \t window# \t tab# \t tabName \t cwd`.
+///
+/// Three bulk queries per WINDOW, not one property fetch per terminal (spec 016). Every `of tm`
+/// crossing the `tell` boundary is its own Apple Event, delivered synchronously to cmux's MAIN
+/// thread — the one drawing its UI and reading its keystrokes — so a per-terminal loop makes cmux
+/// choose between answering fleetops and answering the user. The plural forms fetch a whole window
+/// in three round-trips regardless of terminal count: measured 175 ms → 92 ms of main-thread cost,
+/// byte-identical output (plan 003).
+///
 /// `d` is bound outside the `tell` block — see the module header on the `tab` class shadowing.
 const LIST_SCRIPT: &str = r#"set d to character id 9
 set out to ""
 tell application "cmux"
-  set wi to 0
-  repeat with w in windows
-    set wi to wi + 1
-    set ti to 0
-    repeat with t in tabs of w
-      set ti to ti + 1
-      repeat with tm in terminals of t
-        set out to out & (id of tm) & d & wi & d & ti & d & (name of t) & d & (working directory of tm) & linefeed
+  repeat with wi from 1 to (count of windows)
+    set w to window wi
+    set tabNames to name of every tab of w
+    set idsPerTab to id of every terminal of every tab of w
+    set cwdsPerTab to working directory of every terminal of every tab of w
+    repeat with ti from 1 to (count of tabNames)
+      set tn to item ti of tabNames
+      set ids to item ti of idsPerTab
+      set cwds to item ti of cwdsPerTab
+      repeat with k from 1 to (count of ids)
+        set out to out & (item k of ids) & d & wi & d & ti & d & tn & d & (item k of cwds) & linefeed
       end repeat
     end repeat
   end repeat
@@ -198,15 +214,21 @@ pub struct SurfaceCache {
 }
 
 impl SurfaceCache {
-    /// Fold a fetch result into `(surfaces, lane_error)`. A success replaces the cache; a failure
-    /// keeps the last good list and reports the error.
-    pub fn fold(&mut self, result: AppResult<Vec<Surface>>) -> (Vec<Surface>, Option<String>) {
+    /// Fold a fetch result into `(surfaces, lane_error)`. `Some(Ok)` replaces the cache;
+    /// `Some(Err)` keeps the last good list and reports the error; `None` means the lane was not
+    /// swept this round (spec 016) and serves the cache silently — a planned skip is not
+    /// degradation, and most sweeps skip.
+    pub fn fold(
+        &mut self,
+        result: Option<AppResult<Vec<Surface>>>,
+    ) -> (Vec<Surface>, Option<String>) {
         match result {
-            Ok(surfaces) => {
+            Some(Ok(surfaces)) => {
                 self.last_good.clone_from(&surfaces);
                 (surfaces, None)
             }
-            Err(e) => (self.last_good.clone(), Some(e.to_string())),
+            Some(Err(e)) => (self.last_good.clone(), Some(e.to_string())),
+            None => (self.last_good.clone(), None),
         }
     }
 }
@@ -362,18 +384,37 @@ mod tests {
         use crate::error::AppError;
         let mut cache = SurfaceCache::default();
         let good = parse_list(FIXTURE);
-        let (rows, err) = cache.fold(Ok(good.clone()));
+        let (rows, err) = cache.fold(Some(Ok(good.clone())));
         assert_eq!(rows.len(), 7);
         assert!(err.is_none());
 
-        let (rows, err) = cache.fold(Err(AppError::Timeout {
+        let (rows, err) = cache.fold(Some(Err(AppError::Timeout {
             program: "osascript".to_string(),
             seconds: 5,
-        }));
+        })));
         assert_eq!(rows, good, "stale beats blank — the PANE column survives");
         assert!(
             err.is_some(),
             "but the footer must say the lane is degraded"
+        );
+    }
+
+    #[test]
+    fn a_skipped_sweep_serves_the_cache_without_reporting_an_error() {
+        // Spec 016: the cmux lane sweeps on its own slower cadence, so most sensor sweeps do NOT
+        // fetch it. That is a planned skip, not a degraded lane — the rows must keep their POS and
+        // STREAM values and the footer must stay quiet. Conflating it with a failure would put a
+        // permanent error in the footer, since most sweeps skip.
+        let mut cache = SurfaceCache::default();
+        let good = parse_list(FIXTURE);
+        let (_, err) = cache.fold(Some(Ok(good.clone())));
+        assert!(err.is_none());
+
+        let (rows, err) = cache.fold(None);
+        assert_eq!(rows, good, "a skipped sweep still renders POS and STREAM");
+        assert!(
+            err.is_none(),
+            "a planned skip is not degradation — the footer must stay quiet"
         );
     }
 

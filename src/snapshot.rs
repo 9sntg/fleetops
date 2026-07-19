@@ -96,7 +96,9 @@ pub async fn run(runner: &dyn Runner) -> (String, bool) {
         collect::collect(
             &mut tails,
             &mut surface_cache,
-            surfaces_result,
+            // A one-shot always sweeps cmux — the board's cadence (spec 016) is a live-loop
+            // concern, and there is no prior cache for a skip to fall back on.
+            Some(surfaces_result),
             procs_result,
             &codex_procs,
         )

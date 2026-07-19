@@ -46,10 +46,12 @@ pub struct Collected {
 
 /// Scan + fold the whole fleet into sorted rows, reusing the given caches. `surfaces_result`,
 /// `procs_result` and `codex_procs` are already fetched by the caller (all off the blocking task).
+/// A `None` `surfaces_result` means the caller skipped the cmux lane this round — its own cadence
+/// (spec 016) — and `SurfaceCache` serves the last-good topology silently.
 pub fn collect(
     tails: &mut TailCache,
     surface_cache: &mut SurfaceCache,
-    surfaces_result: AppResult<Vec<Surface>>,
+    surfaces_result: Option<AppResult<Vec<Surface>>>,
     procs_result: AppResult<ProcTable>,
     codex_procs: &[ProcInfo],
 ) -> Collected {

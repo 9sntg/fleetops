@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+- **Running `fleet` no longer freezes cmux (spec 016, wave 16)** — the board took roughly **9 % of
+  cmux's main thread, permanently**; it now takes **~1 %**.
+  - **The cause was the transport, not the polling.** Apple Events are delivered synchronously to
+    an app's main thread — the same one drawing cmux's UI and reading its keystrokes — so every
+    sweep made cmux choose between answering fleetops and answering the operator.
+  - **`LIST_SCRIPT` now uses bulk plural queries** (`id of every terminal of every tab of w`)
+    instead of per-terminal property access inside a triple-nested loop. Every `of tm` crossing the
+    `tell` boundary was its own Apple Event, so the old cost scaled with terminal count.
+    **179 ms → 94 ms per sweep, byte-identical output** — verified by `diff` against the previous
+    script on a live cmux, not by inspection.
+  - **The cmux lane now sweeps every 10 s instead of every 2 s.** Nothing the operator watches at
+    2 s comes from cmux: status, tokens, ctx % and title all come from `ps` and the transcript
+    tails. cmux supplies only window index, tab index, workspace name and cwd, which change when a
+    tab is created, closed, renamed or reordered. `SurfaceCache` serves the last-good topology in
+    between, so POS and STREAM never blank out — and a **skipped sweep is not a degraded lane**,
+    so the footer stays quiet. A rename now appears within one cmux cadence; pressing `r` forces
+    an immediate re-read.
+  - **Two better transports were falsified, not assumed** (`plans/003-cmux-poll-cost/`). The
+    control socket is 10 ms and off-thread but gated by **process ancestry** — a `launchd`-parented
+    process is refused, and `fleet` runs outside cmux (an earlier test that only stripped the env
+    vars ran from a cmux descendant and proved nothing). The event bus carries `workspace.renamed`
+    but is emitted by the socket RPC layer: a **sidebar** rename fired zero events across a
+    201-event window while the title demonstrably changed, so a push design would have passed
+    testing and failed in use.
+  - Workspace colors remain unavailable: AppleScript exposes no color property on a tab
+    (`properties of tab` returns only `focused terminal, id, name, class, selected, index`).
+
 - **STREAM + BRANCH columns (spec 015, wave 15)** — two new columns between DIR and SESSION.
   - **STREAM** is the cmux workspace name (cmux's own term for a unit of work is "workstream").
     It rides in on the existing AppleScript call and comes from the *surface match*, not the cwd —
