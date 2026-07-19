@@ -18,9 +18,8 @@
 //! - Async work never runs on the UI task — sweeps and jumps are spawned; the loop only `select!`s.
 //! - Read-only over the fleet; the only mutating verbs are cmux `focus` (jump) and the OSC 11/111
 //!   pane-tint writes (spec 006).
-//! - Two cadences, not one (spec 016): `ps` + transcript tails every `POLL`, but cmux only every
-//!   `CMUX_EVERY`th sweep. Its `osascript` call lands on cmux's MAIN thread, so sweeping it at
-//!   `POLL` pins the app the operator is trying to use. Do not collapse them back into one.
+//! - Two cadences, not one (spec 016): `ps` + transcript tails every `POLL`, cmux on the slower
+//!   `CMUX_INTERVAL` — see that const for why. Do not collapse them back into one.
 
 pub mod keys;
 pub mod model;
@@ -30,6 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream};
+use futures::future::OptionFuture;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -52,13 +52,19 @@ struct SweepCaches {
 const POLL: Duration = Duration::from_secs(2);
 /// Footer age / redraw tick.
 const TICK: Duration = Duration::from_secs(1);
-/// The cmux lane rides every Nth sensor sweep — 5 × 2 s = 10 s (spec 016).
+/// The cmux lane's own cadence (spec 016).
 ///
 /// Nothing the operator watches at 2 s comes from cmux: status, tokens, ctx % and title all come
 /// from `ps` and the transcript tails. cmux supplies window index, tab index, workspace name and
 /// cwd, which change only when a tab is created, closed, renamed or reordered. Sweeping that at
-/// 2 s is what pins cmux's main thread.
-const CMUX_EVERY: u64 = 5;
+/// `POLL` is what pins cmux's main thread.
+const CMUX_INTERVAL: Duration = Duration::from_secs(10);
+/// The cadence above, as a sweep-count divisor — the loop counts sweeps, not seconds. Derived so
+/// that retuning `POLL` preserves the cmux cadence instead of silently scaling it.
+const CMUX_EVERY: u64 = CMUX_INTERVAL.as_secs() / POLL.as_secs();
+// A `POLL` slower than `CMUX_INTERVAL` would floor the divisor to 0 and make `cmux_due` divide by
+// zero at runtime. Fail at compile time instead.
+const _: () = assert!(CMUX_EVERY >= 1, "CMUX_INTERVAL must be at least POLL");
 
 /// Whether this sweep refreshes the cmux topology. `seq` is 1-based, so the opening sweep fetches
 /// — otherwise the board would render its first frames with no POS or STREAM at all.
@@ -194,13 +200,7 @@ async fn sweep(
     // Independent lanes — fetch concurrently. The cmux lane rides its own slower cadence, so on
     // most sweeps it is skipped entirely and `SurfaceCache` serves the last-good list (spec 016).
     let (surfaces_result, procs_result) = tokio::join!(
-        async {
-            if refresh_cmux {
-                Some(cmux::list(runner).await)
-            } else {
-                None
-            }
-        },
+        OptionFuture::from(refresh_cmux.then(|| cmux::list(runner))),
         procsrc::fetch(runner)
     );
     // The Codex lane needs the process table (tty gate, surface id, elapsed), so it follows it.
@@ -261,13 +261,15 @@ mod tests {
     }
 
     #[test]
-    fn the_cmux_cadence_is_ten_seconds() {
-        // The freeze is proportional to how often Apple Events land on cmux's main thread, so the
-        // effective cadence — not the divisor — is the number that matters. Asserting the product
-        // keeps POLL and CMUX_EVERY honest: changing either alone breaks this.
+    fn the_derived_divisor_actually_lands_on_the_intended_cadence() {
+        // CMUX_EVERY is integer division, so a POLL that does not divide CMUX_INTERVAL evenly
+        // would silently round the cmux lane to something faster than intended — straight back
+        // toward the freeze this wave fixes. Retuning POLL must fail here, not in the field.
+        let effective = POLL.as_secs() * CMUX_EVERY;
         assert_eq!(
-            POLL * u32::try_from(CMUX_EVERY).expect("cadence divisor fits a u32"),
-            Duration::from_secs(10)
+            effective,
+            CMUX_INTERVAL.as_secs(),
+            "POLL must divide CMUX_INTERVAL evenly"
         );
     }
 }

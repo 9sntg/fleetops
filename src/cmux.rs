@@ -19,11 +19,12 @@
 //!   both inside and outside cmux. Verified live 2026-07-16 (spec 012).
 //! - The surface id is passed as `osascript` **argv**, never interpolated into the script, so a
 //!   hostile id is inert data rather than code. Verified by test.
-//! - `LIST_SCRIPT` uses BULK plural queries (`id of every terminal of every tab of w`), never a
-//!   per-terminal `of tm` inside a loop. Each accessor crossing the `tell` boundary is its own
-//!   Apple Event, delivered synchronously to cmux's main thread; the nested-loop form cost 179 ms
-//!   per sweep against 94 ms for this one, and that time is stolen from cmux's UI. Rewriting it
-//!   into the more readable nested form re-introduces the freeze (spec 016, plan 003).
+//! - Every accessor crossing the `tell` boundary is its own Apple Event, delivered synchronously
+//!   to cmux's MAIN thread — the one drawing its UI and reading its keystrokes. So the POLLED
+//!   script, `LIST_SCRIPT`, uses BULK plural queries and never a per-terminal `of tm` inside a
+//!   loop; rewriting it into the more readable nested form re-introduces the freeze (spec 016,
+//!   plan 003, which carries the numbers). `FOCUS_SCRIPT` is deliberately exempt: it is one-shot
+//!   on a keypress, not polled, and it early-returns on the matching surface.
 //! - `character id 9` is bound OUTSIDE the `tell` block: cmux's dictionary defines a `tab`
 //!   CLASS, which shadows AppleScript's `tab` (tab-character) constant inside `tell` and would
 //!   silently emit the literal text "tab" as the delimiter.
@@ -52,12 +53,14 @@ pub struct Surface {
 
 /// Emit one tab-separated row per terminal: `id \t window# \t tab# \t tabName \t cwd`.
 ///
-/// Three bulk queries per WINDOW, not one property fetch per terminal (spec 016). Every `of tm`
-/// crossing the `tell` boundary is its own Apple Event, delivered synchronously to cmux's MAIN
-/// thread — the one drawing its UI and reading its keystrokes — so a per-terminal loop makes cmux
-/// choose between answering fleetops and answering the user. The plural forms fetch a whole window
-/// in three round-trips regardless of terminal count: measured 175 ms → 92 ms of main-thread cost,
-/// byte-identical output (plan 003).
+/// Three bulk queries per WINDOW, not one property fetch per terminal — see the module header on
+/// why this shape is load-bearing. Cost is then flat in terminal count: measured 179 ms → 94 ms
+/// per sweep, output byte-identical to the nested form against a live cmux (spec 016, plan 003).
+///
+/// Those three queries are three separate Apple Events, so cmux can change between them. The
+/// length check makes that fail LOUDLY: a tab opened mid-scan would otherwise leave the lists
+/// misaligned and pair a workspace name with a different tab's surface ids — a silently wrong
+/// STREAM column. Erroring hands the sweep to `SurfaceCache`, which keeps the last good topology.
 ///
 /// `d` is bound outside the `tell` block — see the module header on the `tab` class shadowing.
 const LIST_SCRIPT: &str = r#"set d to character id 9
@@ -68,7 +71,11 @@ tell application "cmux"
     set tabNames to name of every tab of w
     set idsPerTab to id of every terminal of every tab of w
     set cwdsPerTab to working directory of every terminal of every tab of w
-    repeat with ti from 1 to (count of tabNames)
+    set n to count of tabNames
+    if (count of idsPerTab) is not n or (count of cwdsPerTab) is not n then
+      error "cmux topology changed mid-scan"
+    end if
+    repeat with ti from 1 to n
       set tn to item ti of tabNames
       set ids to item ti of idsPerTab
       set cwds to item ti of cwdsPerTab
@@ -218,17 +225,20 @@ impl SurfaceCache {
     /// `Some(Err)` keeps the last good list and reports the error; `None` means the lane was not
     /// swept this round (spec 016) and serves the cache silently — a planned skip is not
     /// degradation, and most sweeps skip.
+    ///
+    /// Borrows rather than clones precisely because the `None` arm is now the common one: an owned
+    /// `Vec` would trade one Apple Event for a deep copy of every surface, every `POLL`.
     pub fn fold(
         &mut self,
         result: Option<AppResult<Vec<Surface>>>,
-    ) -> (Vec<Surface>, Option<String>) {
+    ) -> (&[Surface], Option<String>) {
         match result {
             Some(Ok(surfaces)) => {
-                self.last_good.clone_from(&surfaces);
-                (surfaces, None)
+                self.last_good = surfaces;
+                (&self.last_good, None)
             }
-            Some(Err(e)) => (self.last_good.clone(), Some(e.to_string())),
-            None => (self.last_good.clone(), None),
+            Some(Err(e)) => (&self.last_good, Some(e.to_string())),
+            None => (&self.last_good, None),
         }
     }
 }

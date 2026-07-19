@@ -84,8 +84,8 @@ pub fn collect(
     // A dead process table empties the board; a degraded cmux lane only costs the PANE column.
     // Surface the more severe one.
     let lane_error = proc_error.or(surface_error);
-    let mut rows = board::assemble(&sessions, &telemetry, &branches, &surfaces);
-    let codex_rows = codex::scan(&paths::codex_dir(), codex_procs, &surfaces);
+    let mut rows = board::assemble(&sessions, &telemetry, &branches, surfaces);
+    let codex_rows = codex::scan(&paths::codex_dir(), codex_procs, surfaces);
     let codex_count = codex_rows.len();
     rows.extend(codex_rows);
     board::sort_rows(&mut rows);
