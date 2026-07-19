@@ -19,6 +19,12 @@
 //!   both inside and outside cmux. Verified live 2026-07-16 (spec 012).
 //! - The surface id is passed as `osascript` **argv**, never interpolated into the script, so a
 //!   hostile id is inert data rather than code. Verified by test.
+//! - Every accessor crossing the `tell` boundary is its own Apple Event, delivered synchronously
+//!   to cmux's MAIN thread — the one drawing its UI and reading its keystrokes. So the POLLED
+//!   script, `LIST_SCRIPT`, uses BULK plural queries and never a per-terminal `of tm` inside a
+//!   loop; rewriting it into the more readable nested form re-introduces the freeze (spec 016,
+//!   plan 003, which carries the numbers). `FOCUS_SCRIPT` is deliberately exempt: it is one-shot
+//!   on a keypress, not polled, and it early-returns on the matching surface.
 //! - `character id 9` is bound OUTSIDE the `tell` block: cmux's dictionary defines a `tab`
 //!   CLASS, which shadows AppleScript's `tab` (tab-character) constant inside `tell` and would
 //!   silently emit the literal text "tab" as the delimiter.
@@ -46,18 +52,35 @@ pub struct Surface {
 }
 
 /// Emit one tab-separated row per terminal: `id \t window# \t tab# \t tabName \t cwd`.
+///
+/// Three bulk queries per WINDOW, not one property fetch per terminal — see the module header on
+/// why this shape is load-bearing. Cost is then flat in terminal count: measured 179 ms → 94 ms
+/// per sweep, output byte-identical to the nested form against a live cmux (spec 016, plan 003).
+///
+/// Those three queries are three separate Apple Events, so cmux can change between them. The
+/// length check makes that fail LOUDLY: a tab opened mid-scan would otherwise leave the lists
+/// misaligned and pair a workspace name with a different tab's surface ids — a silently wrong
+/// STREAM column. Erroring hands the sweep to `SurfaceCache`, which keeps the last good topology.
+///
 /// `d` is bound outside the `tell` block — see the module header on the `tab` class shadowing.
 const LIST_SCRIPT: &str = r#"set d to character id 9
 set out to ""
 tell application "cmux"
-  set wi to 0
-  repeat with w in windows
-    set wi to wi + 1
-    set ti to 0
-    repeat with t in tabs of w
-      set ti to ti + 1
-      repeat with tm in terminals of t
-        set out to out & (id of tm) & d & wi & d & ti & d & (name of t) & d & (working directory of tm) & linefeed
+  repeat with wi from 1 to (count of windows)
+    set w to window wi
+    set tabNames to name of every tab of w
+    set idsPerTab to id of every terminal of every tab of w
+    set cwdsPerTab to working directory of every terminal of every tab of w
+    set n to count of tabNames
+    if (count of idsPerTab) is not n or (count of cwdsPerTab) is not n then
+      error "cmux topology changed mid-scan"
+    end if
+    repeat with ti from 1 to n
+      set tn to item ti of tabNames
+      set ids to item ti of idsPerTab
+      set cwds to item ti of cwdsPerTab
+      repeat with k from 1 to (count of ids)
+        set out to out & (item k of ids) & d & wi & d & ti & d & tn & d & (item k of cwds) & linefeed
       end repeat
     end repeat
   end repeat
@@ -198,15 +221,24 @@ pub struct SurfaceCache {
 }
 
 impl SurfaceCache {
-    /// Fold a fetch result into `(surfaces, lane_error)`. A success replaces the cache; a failure
-    /// keeps the last good list and reports the error.
-    pub fn fold(&mut self, result: AppResult<Vec<Surface>>) -> (Vec<Surface>, Option<String>) {
+    /// Fold a fetch result into `(surfaces, lane_error)`. `Some(Ok)` replaces the cache;
+    /// `Some(Err)` keeps the last good list and reports the error; `None` means the lane was not
+    /// swept this round (spec 016) and serves the cache silently — a planned skip is not
+    /// degradation, and most sweeps skip.
+    ///
+    /// Borrows rather than clones precisely because the `None` arm is now the common one: an owned
+    /// `Vec` would trade one Apple Event for a deep copy of every surface, every `POLL`.
+    pub fn fold(
+        &mut self,
+        result: Option<AppResult<Vec<Surface>>>,
+    ) -> (&[Surface], Option<String>) {
         match result {
-            Ok(surfaces) => {
-                self.last_good.clone_from(&surfaces);
-                (surfaces, None)
+            Some(Ok(surfaces)) => {
+                self.last_good = surfaces;
+                (&self.last_good, None)
             }
-            Err(e) => (self.last_good.clone(), Some(e.to_string())),
+            Some(Err(e)) => (&self.last_good, Some(e.to_string())),
+            None => (&self.last_good, None),
         }
     }
 }
@@ -362,18 +394,37 @@ mod tests {
         use crate::error::AppError;
         let mut cache = SurfaceCache::default();
         let good = parse_list(FIXTURE);
-        let (rows, err) = cache.fold(Ok(good.clone()));
+        let (rows, err) = cache.fold(Some(Ok(good.clone())));
         assert_eq!(rows.len(), 7);
         assert!(err.is_none());
 
-        let (rows, err) = cache.fold(Err(AppError::Timeout {
+        let (rows, err) = cache.fold(Some(Err(AppError::Timeout {
             program: "osascript".to_string(),
             seconds: 5,
-        }));
+        })));
         assert_eq!(rows, good, "stale beats blank — the PANE column survives");
         assert!(
             err.is_some(),
             "but the footer must say the lane is degraded"
+        );
+    }
+
+    #[test]
+    fn a_skipped_sweep_serves_the_cache_without_reporting_an_error() {
+        // Spec 016: the cmux lane sweeps on its own slower cadence, so most sensor sweeps do NOT
+        // fetch it. That is a planned skip, not a degraded lane — the rows must keep their POS and
+        // STREAM values and the footer must stay quiet. Conflating it with a failure would put a
+        // permanent error in the footer, since most sweeps skip.
+        let mut cache = SurfaceCache::default();
+        let good = parse_list(FIXTURE);
+        let (_, err) = cache.fold(Some(Ok(good.clone())));
+        assert!(err.is_none());
+
+        let (rows, err) = cache.fold(None);
+        assert_eq!(rows, good, "a skipped sweep still renders POS and STREAM");
+        assert!(
+            err.is_none(),
+            "a planned skip is not degradation — the footer must stay quiet"
         );
     }
 

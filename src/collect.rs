@@ -46,10 +46,12 @@ pub struct Collected {
 
 /// Scan + fold the whole fleet into sorted rows, reusing the given caches. `surfaces_result`,
 /// `procs_result` and `codex_procs` are already fetched by the caller (all off the blocking task).
+/// A `None` `surfaces_result` means the caller skipped the cmux lane this round — its own cadence
+/// (spec 016) — and `SurfaceCache` serves the last-good topology silently.
 pub fn collect(
     tails: &mut TailCache,
     surface_cache: &mut SurfaceCache,
-    surfaces_result: AppResult<Vec<Surface>>,
+    surfaces_result: Option<AppResult<Vec<Surface>>>,
     procs_result: AppResult<ProcTable>,
     codex_procs: &[ProcInfo],
 ) -> Collected {
@@ -82,8 +84,8 @@ pub fn collect(
     // A dead process table empties the board; a degraded cmux lane only costs the PANE column.
     // Surface the more severe one.
     let lane_error = proc_error.or(surface_error);
-    let mut rows = board::assemble(&sessions, &telemetry, &branches, &surfaces);
-    let codex_rows = codex::scan(&paths::codex_dir(), codex_procs, &surfaces);
+    let mut rows = board::assemble(&sessions, &telemetry, &branches, surfaces);
+    let codex_rows = codex::scan(&paths::codex_dir(), codex_procs, surfaces);
     let codex_count = codex_rows.len();
     rows.extend(codex_rows);
     board::sort_rows(&mut rows);

@@ -3,20 +3,23 @@
 //! Project: Fleetops — TUI monitoring all running Claude Code sessions (the fleet)
 //! Module:  src/tui/mod.rs
 //! Deps:    ratatui (init/restore + panic hook), crossterm (EventStream), tokio;
-//!          collect, board, panes, highlight, runner
-//! Tested:  the seams are tested in keys/model/view/board/codex/collect/…; this loop is the thin I/O shell.
+//!          collect, board, cmux, highlight, runner
+//! Tested:  cadence in inline `#[cfg(test)]`; the rest of the seams are tested in
+//!          keys/model/view/board/codex/collect/… — this loop is the thin I/O shell.
 //!
 //! Key responsibilities:
 //! - Own the terminal (via `ratatui::try_init`/`try_restore` — installs the panic hook) and the loop.
-//! - `sweep`: one sensor pass — wezterm list (async, bounded) handed to `collect::collect`
+//! - `sweep`: one sensor pass — cmux topology + `ps` (async, bounded) handed to `collect::collect`
 //!   (blocking fs via `spawn_blocking`: sessions scan + transcript tails + Codex rows, sorted
 //!   once) → `Snapshot` over the mpsc channel. `collect` is the SAME code `fleet snapshot` runs
 //!   (spec 009), so the board and the snapshot never disagree.
 //!
 //! Design constraints:
 //! - Async work never runs on the UI task — sweeps and jumps are spawned; the loop only `select!`s.
-//! - Read-only over the fleet; the only mutating verbs are `activate-tab`/`-pane` (focus) and
-//!   the OSC 11/111 pane-tint writes (spec 006).
+//! - Read-only over the fleet; the only mutating verbs are cmux `focus` (jump) and the OSC 11/111
+//!   pane-tint writes (spec 006).
+//! - Two cadences, not one (spec 016): `ps` + transcript tails every `POLL`, cmux on the slower
+//!   `CMUX_INTERVAL` — see that const for why. Do not collapse them back into one.
 
 pub mod keys;
 pub mod model;
@@ -26,6 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream};
+use futures::future::OptionFuture;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -48,6 +52,25 @@ struct SweepCaches {
 const POLL: Duration = Duration::from_secs(2);
 /// Footer age / redraw tick.
 const TICK: Duration = Duration::from_secs(1);
+/// The cmux lane's own cadence (spec 016).
+///
+/// Nothing the operator watches at 2 s comes from cmux: status, tokens, ctx % and title all come
+/// from `ps` and the transcript tails. cmux supplies window index, tab index, workspace name and
+/// cwd, which change only when a tab is created, closed, renamed or reordered. Sweeping that at
+/// `POLL` is what pins cmux's main thread.
+const CMUX_INTERVAL: Duration = Duration::from_secs(10);
+/// The cadence above, as a sweep-count divisor — the loop counts sweeps, not seconds. Derived so
+/// that retuning `POLL` preserves the cmux cadence instead of silently scaling it.
+const CMUX_EVERY: u64 = CMUX_INTERVAL.as_secs() / POLL.as_secs();
+// A `POLL` slower than `CMUX_INTERVAL` would floor the divisor to 0 and make `cmux_due` divide by
+// zero at runtime. Fail at compile time instead.
+const _: () = assert!(CMUX_EVERY >= 1, "CMUX_INTERVAL must be at least POLL");
+
+/// Whether this sweep refreshes the cmux topology. `seq` is 1-based, so the opening sweep fetches
+/// — otherwise the board would render its first frames with no POS or STREAM at all.
+const fn cmux_due(seq: u64) -> bool {
+    seq % CMUX_EVERY == 1
+}
 
 /// Run the board until the user quits. `highlight_enabled` gates the OSC pane-tint writes
 /// (`fleet --no-highlight`) — the model still computes them, the loop just drops them.
@@ -106,7 +129,7 @@ async fn event_loop(
             Some(msg) = rx.recv() => app.update(msg),
             _ = poll.tick() => {
                 sweep_seq += 1;
-                spawn_sweep(&runner, &cache, &tx, sweep_seq);
+                spawn_sweep(&runner, &cache, &tx, sweep_seq, cmux_due(sweep_seq));
             }
             _ = tick.tick() => app.update(Msg::Tick),
         }
@@ -117,7 +140,9 @@ async fn event_loop(
             // per keypress — one manual sweep in flight at a time.
             if app.sweeps_settled(sweep_seq) {
                 sweep_seq += 1;
-                spawn_sweep(&runner, &cache, &tx, sweep_seq);
+                // A manual refresh always re-reads cmux: asking for fresh data and getting a
+                // cached topology back would make `r` look broken right after a rename.
+                spawn_sweep(&runner, &cache, &tx, sweep_seq, true);
             }
         }
         if let Some(target) = app.pending_jump.take() {
@@ -145,12 +170,13 @@ fn spawn_sweep(
     cache: &Arc<Mutex<SweepCaches>>,
     tx: &mpsc::Sender<Msg>,
     seq: u64,
+    refresh_cmux: bool,
 ) {
     let runner = Arc::clone(runner);
     let cache = Arc::clone(cache);
     let tx = tx.clone();
     tokio::spawn(async move {
-        let msg = match sweep(runner.as_ref(), &cache).await {
+        let msg = match sweep(runner.as_ref(), &cache, refresh_cmux).await {
             Ok(mut snapshot) => {
                 snapshot.seq = seq;
                 Msg::Snapshot(Box::new(snapshot))
@@ -166,9 +192,17 @@ fn spawn_sweep(
 /// LAST GOOD pane list keeps TAB/PANE matches alive (stale beats blank; the footer says so).
 /// The row assembly itself is `collect::collect` — the SAME code `fleet snapshot` runs, so the
 /// board and the snapshot can never disagree (spec 009).
-async fn sweep(runner: &dyn Runner, cache: &Arc<Mutex<SweepCaches>>) -> Result<Snapshot, String> {
-    // Independent lanes — fetch concurrently.
-    let (surfaces_result, procs_result) = tokio::join!(cmux::list(runner), procsrc::fetch(runner));
+async fn sweep(
+    runner: &dyn Runner,
+    cache: &Arc<Mutex<SweepCaches>>,
+    refresh_cmux: bool,
+) -> Result<Snapshot, String> {
+    // Independent lanes — fetch concurrently. The cmux lane rides its own slower cadence, so on
+    // most sweeps it is skipped entirely and `SurfaceCache` serves the last-good list (spec 016).
+    let (surfaces_result, procs_result) = tokio::join!(
+        OptionFuture::from(refresh_cmux.then(|| cmux::list(runner))),
+        procsrc::fetch(runner)
+    );
     // The Codex lane needs the process table (tty gate, surface id, elapsed), so it follows it.
     // A failed Codex lane costs its rows, never the board.
     let codex_procs = match &procs_result {
@@ -210,4 +244,32 @@ fn spawn_jump(runner: &Arc<dyn Runner>, tx: &mpsc::Sender<Msg>, target: board::M
             let _ = tx.send(Msg::Error(format!("jump: {e}"))).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_cmux_lane_sweeps_on_the_first_tick_then_every_fifth() {
+        // Spec 016: the first sweep MUST fetch, or the board opens with no POS/STREAM at all.
+        assert!(cmux_due(1), "the opening sweep populates the cache");
+        for seq in 2..=5 {
+            assert!(!cmux_due(seq), "sweep {seq} rides the cache");
+        }
+        assert!(cmux_due(6), "and the lane refreshes on the next cadence");
+    }
+
+    #[test]
+    fn the_derived_divisor_actually_lands_on_the_intended_cadence() {
+        // CMUX_EVERY is integer division, so a POLL that does not divide CMUX_INTERVAL evenly
+        // would silently round the cmux lane to something faster than intended — straight back
+        // toward the freeze this wave fixes. Retuning POLL must fail here, not in the field.
+        let effective = POLL.as_secs() * CMUX_EVERY;
+        assert_eq!(
+            effective,
+            CMUX_INTERVAL.as_secs(),
+            "POLL must divide CMUX_INTERVAL evenly"
+        );
+    }
 }

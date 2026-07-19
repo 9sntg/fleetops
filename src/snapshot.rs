@@ -96,7 +96,7 @@ pub async fn run(runner: &dyn Runner) -> (String, bool) {
         collect::collect(
             &mut tails,
             &mut surface_cache,
-            surfaces_result,
+            Some(surfaces_result), // one-shot: always sweep, nothing cached to skip to
             procs_result,
             &codex_procs,
         )
